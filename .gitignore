@@ -1,0 +1,48 @@
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Rust / Tauri build output
+app/src-tauri/target/
+app/src-tauri/gen/schemas/
+
+# Secrets & machine-local config
+.env
+.env.local
+app/.env
+app/.env.local
+client_secret_*.json
+native-host/dev-key/
+native-host/com.clipflow.host.json
+
+# Logs & scratch
+*.log
+npm-debug.log*
+pnpm-debug.log*
+.scratch/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# Local tooling / machine-specific launchers
+.claude/
+Start ClipFlow.vbs
+tiktok*.txt
+
+# Internal planning docs — not part of the public repo (see README)
+/AI_ENGINE_SETUP.md
+/NEXT_PHASE.md
+/PHASE2_STATUS.md
+/SPEC.md
+/TIKTOK_APP_SETUP.md
+/TIKTOK_INTEGRATION_HANDOFF.md
+/script.md
+
+# Local ad-generation projects (Remotion, API keys in .env) & raw recordings
+ads/
+*.mkv

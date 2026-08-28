@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "ClipFlow AI Engine",
+  "version": "1.0",
+  "description": "Drives ClipFlow's 3 AI functions (Smart Trimmer, Clip Finder, Caption Generator) via DeepSeek chat.",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "nativeMessaging",
+    "webNavigation",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://localhost:8080/*",
+    "https://chat.deepseek.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost:8080/*",
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+K"
+      }
+    }
+  },
+  "action": {
+    "default_title": "ClipFlow AI Engine",
+    "default_popup": "popup.html"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqu5Y5jxTqzTDNOpE/zUhIwbw0gc+DVnF94G6TGv+MZCdDROzYH6f0EQ5N2LwfvVYXoyCqatUW31oEoQkd+euAVdcNwmGVBbF422I7/S2wd1tmV7Kg0oW6F9Xv7QjCwA701j0pMEUdEtU3d/000h9Uf/dstE1x5Ny96Yoitad+R9TOm/dWFY8XMUfgJK1oDmkx7Gv8e/NTtk1AGiQGCMxDmo6z56C8RJNpIf/n7P6o17aC8/ww6MjL7a1IfvVf+pSi1tLtSuYm19nYAXFoxGni14sDiZ6YXsHPV1N8lDsPgiwKL1IEpdjDX8FmO1FNdgizdMZrwzGS5gHAnliyVWwhwIDAQAB"
+}

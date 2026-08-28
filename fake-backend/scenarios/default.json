@@ -1,0 +1,12 @@
+{
+  "description": "Happy-path single-turn replies for all 3 ClipFlow AI functions.",
+  "trim": [
+    "[{\"start\": \"00:00:00\", \"end\": \"00:02:15\"}, {\"start\": \"01:45:30\", \"end\": \"01:48:00\"}]"
+  ],
+  "clips": [
+    "[{\"start\": \"00:15:30\", \"end\": \"00:16:45\", \"hook\": \"Character reveals hidden identity - high shock value\"}, {\"start\": \"00:32:10\", \"end\": \"00:33:20\", \"hook\": \"Explosive confrontation between rivals\"}]"
+  ],
+  "caption": [
+    "He never saw the betrayal coming. #movieclip #plottwist #viral #fyp"
+  ]
+}

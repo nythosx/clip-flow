@@ -1,0 +1,7 @@
+{
+  "description": "First reply isn't valid JSON, exercising the reformat-as-JSON retry (SPEC.md section 6 error handling). The mock chat UI's Edit->Save&Resubmit path removes the bad turn and everything after it, then resends — landing on the next scripted turn, same as editMessage does against the real site.",
+  "trim": [
+    "Sure! Here are the segments I think should be removed, let me explain my reasoning first...",
+    "[{\"start\": \"00:00:00\", \"end\": \"00:01:40\"}]"
+  ]
+}

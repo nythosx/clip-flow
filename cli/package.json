@@ -1,0 +1,14 @@
+{
+  "name": "clipflow-cli",
+  "version": "1.0.0",
+  "description": "ClipFlow's DeepSeek-chat-driven AI Engine CLI — orchestrates the browser-automation bridge via a Chrome extension and native host",
+  "bin": {
+    "clipflow-cli": "./index.js"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "commander": "^12.1.0",
+    "ws": "^8.18.0",
+    "uuid": "^10.0.0"
+  }
+}

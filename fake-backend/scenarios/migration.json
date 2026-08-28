@@ -1,0 +1,9 @@
+{
+  "description": "Enough caption turns to cross a low migrationThreshold (set to 2 in tests) and exercise chat migration: 2 real captions, then a migration-summary turn (from editing the 3rd-last message), then a post-migration re-prime ack, then a 3rd real caption on the fresh tab.",
+  "caption": [
+    "Caption one! #one #fyp",
+    "Caption two! #two #fyp",
+    "SUMMARY: generated captions for clip 1 and clip 2 so far. Continue generating captions for the remaining clips in the same style.",
+    "Caption three, post-migration! #three #fyp"
+  ]
+}
