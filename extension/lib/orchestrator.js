@@ -13,6 +13,17 @@ const Orchestrator = (() => {
   // sessionKey -> { tabId, purpose, msgCount }
   const sessions = new Map();
 
+  // Non-terminal progress narration for one AI call — see protocol.js's AI_STATUS doc
+  // comment. Best-effort: NativeBridge always exists in this shared service-worker scope by
+  // the time Orchestrator runs, but never let a status ping itself break the actual call.
+  function reportStatus(requestId, message) {
+    try {
+      NativeBridge.sendToCli({ type: AI_MESSAGE_TYPES.AI_STATUS, requestId, message });
+    } catch (err) {
+      console.warn('[Orchestrator] reportStatus failed', err);
+    }
+  }
+
   // Enforced across ALL sessions/purposes, per SPEC.md section 6 ("Minimum 30-second delay
   // between AI calls") — a single shared gate, not per-session, since it's meant to bound
   // total request rate against chat.deepseek.com.
@@ -438,11 +449,13 @@ const Orchestrator = (() => {
   // page is reloaded — no amount of retrying sendMessage recovers it, only a fresh tab does).
   async function startFreshSession(sessionKey, purpose, primer, task, requestId, opts) {
     const { deepThink, webSearch, timeoutMs } = opts;
+    reportStatus(requestId, 'Opening a new AI chat tab…');
     const tabId = await TabManager.createChatTab(purpose, requestId);
     await TabManager.waitForReady(tabId);
     if (deepThink || webSearch) await TabManager.setToggles(tabId, { deepThink, webSearch });
     const session = { tabId, purpose, msgCount: 0, urlTaskId: requestId };
     sessions.set(sessionKey, session);
+    reportStatus(requestId, 'Tab ready — sending prompt…');
     const res = await TabManager.sendToTab(tabId, {
       action: 'typeAndSend',
       text: `${primer}\n\n${task}`,
@@ -455,6 +468,7 @@ const Orchestrator = (() => {
     // and the crash surfaces much later as a confusing "Cannot read properties of
     // undefined (reading 'trim')" instead of the real cause.
     if (res.error) throw new Error(res.error);
+    reportStatus(requestId, 'Response received — parsing…');
     session.msgCount = 1;
     await saveSession(sessionKey, session);
     return res.text;
@@ -498,8 +512,10 @@ const Orchestrator = (() => {
       await clearSavedSession(sessionKey);
       return startFreshSession(sessionKey, purpose, primer, task, requestId, sessionOpts);
     }
+    reportStatus(requestId, 'Sending prompt to existing chat…');
     const res = await TabManager.sendToTab(session.tabId, { action: 'typeAndSend', text: task, timeoutMs });
     if (res.error) throw new Error(res.error);
+    reportStatus(requestId, 'Response received — parsing…');
     session.msgCount++;
     await saveSession(sessionKey, session);
     return res.text;
@@ -527,8 +543,9 @@ const Orchestrator = (() => {
   // the conversation (by editing the 3rd-last message so the edit's reply IS the summary),
   // close the old tab, open a fresh one, and re-prime it with that summary so the next call
   // on this sessionKey continues seamlessly.
-  async function migrate(sessionKey, primer, opts = {}) {
+  async function migrate(sessionKey, primer, opts = {}, requestId) {
     const { deepThink = false, webSearch = false, timeoutMs } = opts;
+    reportStatus(requestId, 'Conversation getting long — migrating to a fresh tab…');
     const session = sessions.get(sessionKey);
     const oldTabId = session.tabId;
     const editIndex = Math.max(0, session.msgCount - 3);
@@ -573,10 +590,10 @@ const Orchestrator = (() => {
     await saveSession(sessionKey, session);
   }
 
-  async function maybeMigrate(sessionKey, primer, migrationThreshold, opts) {
+  async function maybeMigrate(sessionKey, primer, migrationThreshold, opts, requestId) {
     const session = sessions.get(sessionKey);
     if (session.msgCount >= migrationThreshold) {
-      await migrate(sessionKey, primer, opts);
+      await migrate(sessionKey, primer, opts, requestId);
     }
   }
 
@@ -605,6 +622,7 @@ const Orchestrator = (() => {
   }) {
     const key = sessionKey || requestId;
     const sessionOpts = { deepThink, webSearch, timeoutMs };
+    reportStatus(requestId, 'Preparing AI request…');
     await enforceMinDelay(minAiCallIntervalMs);
 
     let text = await sendToSession(key, purpose, primer, task, requestId, sessionOpts);
@@ -618,6 +636,7 @@ const Orchestrator = (() => {
         parsed = parseFn(text);
       } catch (firstErr) {
         firstAttemptText = text;
+        reportStatus(requestId, `Response wasn't valid ${shapeLabel} — asking for a reformat…`);
         text = await editLastMessage(key, `Please reformat your response as valid ${shapeLabel} only.`, timeoutMs);
         try {
           parsed = parseFn(text);
@@ -637,6 +656,7 @@ const Orchestrator = (() => {
       if (validate) {
         let problem = validate(parsed, task);
         if (problem) {
+          reportStatus(requestId, `Response needs a correction — ${problem}`.slice(0, 180));
           const correctionText = await editLastMessage(
             key,
             `Your previous answer is wrong: ${problem} Please send a corrected ${shapeLabel} only.`,
@@ -658,11 +678,11 @@ const Orchestrator = (() => {
         }
       }
 
-      await maybeMigrate(key, primer, migrationThreshold, sessionOpts);
+      await maybeMigrate(key, primer, migrationThreshold, sessionOpts, requestId);
       return parsed;
     }
 
-    await maybeMigrate(key, primer, migrationThreshold, sessionOpts);
+    await maybeMigrate(key, primer, migrationThreshold, sessionOpts, requestId);
     return text.trim();
   }
 

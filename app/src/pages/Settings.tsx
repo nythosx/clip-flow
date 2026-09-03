@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   useSettingsStore,
   SETTING_DEFAULT_TEMPLATE_ID,
@@ -10,8 +11,11 @@ import {
   SETTING_YOUTUBE_API_KEY,
   SETTING_FACEBOOK_APP_ID,
   SETTING_FACEBOOK_APP_SECRET,
+  SETTING_SOUND_ALERTS_ENABLED,
+  SETTING_VOICE_GENDER,
 } from "../stores/settingsStore";
 import { useTemplateStore, TemplateConfig } from "../stores/templateStore";
+import { previewVoice } from "../lib/soundManager";
 
 type DefaultEncoding = TemplateConfig["encoding"];
 
@@ -128,6 +132,39 @@ export default function Settings() {
               </option>
             ))}
           </select>
+        </div>
+
+        <div className="rounded-lg border border-neutral-800 bg-neutral-900 p-4 mb-6 space-y-3">
+          <h2 className="text-sm font-medium text-neutral-300">Sound & voice alerts</h2>
+          <p className="text-xs text-neutral-500">
+            A short spoken line on big milestones (analysis complete, Auto Upload finished,
+            all uploads done, or something failing) plus a quick success/error chime on each
+            individual render and upload.
+          </p>
+          <Field label="Enabled">
+            <input
+              type="checkbox"
+              className="accent-blue-500 w-4 h-4"
+              checked={(settings[SETTING_SOUND_ALERTS_ENABLED] ?? "true") !== "false"}
+              onChange={(e) => setSetting(SETTING_SOUND_ALERTS_ENABLED, e.target.checked ? "true" : "false")}
+            />
+          </Field>
+          <Field label="Voice">
+            <select
+              className="bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-xs"
+              value={settings[SETTING_VOICE_GENDER] === "female" ? "female" : "male"}
+              onChange={(e) => setSetting(SETTING_VOICE_GENDER, e.target.value)}
+            >
+              <option value="male">Male</option>
+              <option value="female">Female</option>
+            </select>
+          </Field>
+          <button
+            className="px-3 py-1.5 rounded bg-neutral-800 hover:bg-neutral-700 text-xs"
+            onClick={() => previewVoice("analysisComplete")}
+          >
+            ▶ Preview voice
+          </button>
         </div>
 
         <div className="rounded-lg border border-neutral-800 bg-neutral-900 p-4 mb-6 space-y-3">
@@ -353,6 +390,31 @@ export default function Settings() {
               Save
             </button>
             {facebookSaved && <span className="text-xs text-green-400">Saved</span>}
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-neutral-800 bg-neutral-900 p-4 mb-6 space-y-2">
+          <h2 className="text-sm font-medium text-neutral-300">Legal</h2>
+          <div className="flex flex-wrap gap-4 text-sm">
+            <Link className="text-blue-400 hover:text-blue-300 underline" to="/legal">
+              View in ClipFlow
+            </Link>
+            <a
+              className="text-blue-400 hover:text-blue-300 underline"
+              href="https://clipflow24.netlify.app/terms"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Terms of Service (web)
+            </a>
+            <a
+              className="text-blue-400 hover:text-blue-300 underline"
+              href="https://clipflow24.netlify.app/privacy"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Privacy Policy (web)
+            </a>
           </div>
         </div>
 

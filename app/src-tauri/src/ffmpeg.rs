@@ -82,6 +82,32 @@ pub fn extract_clip(
     Ok(())
 }
 
+/// Probes `movie_path`'s real duration by asking ffmpeg to open it with no output — it
+/// exits non-zero in that mode (expected, not a failure) but still prints a `Duration:
+/// HH:MM:SS.ms, ...` line to stderr while probing the container. Used to sanity-check a
+/// transcript's timestamps against how long the movie file actually is (see
+/// commands::project::get_transcript_sync_status) — no ffprobe binary required.
+pub fn probe_duration_seconds(movie_path: &str) -> Result<f64, String> {
+    let ffmpeg = ffmpeg_path()?;
+    let output = Command::new(ffmpeg)
+        .args(["-i", movie_path])
+        .output()
+        .map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_duration_line(&stderr).ok_or_else(|| "could not determine movie duration".to_string())
+}
+
+fn parse_duration_line(stderr: &str) -> Option<f64> {
+    let line = stderr.lines().find(|l| l.trim_start().starts_with("Duration:"))?;
+    let after = line.trim_start().strip_prefix("Duration:")?;
+    let ts = after.split(',').next()?.trim();
+    let parts: Vec<&str> = ts.split(':').collect();
+    match parts.as_slice() {
+        [h, m, s] => Some(h.trim().parse::<f64>().ok()? * 3600.0 + m.trim().parse::<f64>().ok()? * 60.0 + s.trim().parse::<f64>().ok()?),
+        _ => None,
+    }
+}
+
 /// Grabs a single frame at `seek_seconds` as a JPEG thumbnail, scaled to 320px wide. Used
 /// for the movie thumbnail and per-clip timeline thumbnails in the project editor UI.
 pub fn extract_thumbnail(movie_path: &str, seek_seconds: f64, output_path: &Path) -> Result<(), String> {
@@ -130,6 +156,13 @@ pub struct TemplateConfig {
     // disabled/empty for templates saved before this field existed.
     #[serde(default = "default_caption2")]
     pub caption2: CaptionConfig,
+    // Transcript-synced subtitle track — unlike `caption`/`caption2`'s fixed text, its text
+    // comes from the project's transcript entries overlapping this clip's time range (see
+    // `commands::render::render_clip_final_inner`), one at a time as the clip plays. Only
+    // styling/position is authored on the template; defaults to disabled for templates saved
+    // before this field existed.
+    #[serde(default = "default_subtitle")]
+    pub subtitle: SubtitleConfig,
     pub encoding: EncodingConfig,
 }
 
@@ -215,6 +248,41 @@ fn default_caption2() -> CaptionConfig {
     }
 }
 
+// Same shape as CaptionConfig minus `text` — the text for each on-screen instant comes from
+// the transcript at render time, not from a field authored on the template.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleConfig {
+    pub enabled: bool,
+    pub font_family: String,
+    pub font_size: f64,
+    #[serde(default = "default_font_weight")]
+    pub font_weight: String,
+    pub font_color: String,
+    pub background_color: String,
+    pub background_opacity: f64,
+    pub padding: f64,
+    pub position: Point,
+    pub max_width: f64,
+    pub alignment: String, // 'left' | 'center' | 'right'
+}
+
+fn default_subtitle() -> SubtitleConfig {
+    SubtitleConfig {
+        enabled: false,
+        font_family: "Arial".to_string(),
+        font_size: 56.0,
+        font_weight: "bold".to_string(),
+        font_color: "#ffffff".to_string(),
+        background_color: "#000000".to_string(),
+        background_opacity: 0.45,
+        padding: 12.0,
+        position: Point { x: 0.1, y: 0.5 },
+        max_width: 880.0,
+        alignment: "center".to_string(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Point {
     pub x: f64,
@@ -237,27 +305,65 @@ fn escape_drawtext(text: &str) -> String {
         .replace('\'', "\u{2019}")
 }
 
+/// Rough per-character width as a fraction of font size, bucketed by glyph shape for a
+/// typical proportional sans/serif face — no font-shaping library is linked in here, so
+/// this can't measure real glyph widths. It replaces a flat 0.55x-of-size average that
+/// systematically underestimated width for caption text: captions skew ALL-CAPS (uppercase
+/// glyphs run much wider than the alphabet-wide average) and the average never varied with
+/// weight, so bold captions — wider than regular at the same size — wrapped too loosely and
+/// their lines overflowed the box on real fonts.
+fn char_width_fraction(c: char) -> f64 {
+    if c == ' ' {
+        0.28
+    } else if c.is_ascii_digit() {
+        0.55
+    } else if c.is_ascii_uppercase() {
+        0.72
+    } else if c.is_ascii_lowercase() {
+        match c {
+            'i' | 'l' | 'j' | 't' | 'f' => 0.28,
+            'm' | 'w' => 0.9,
+            _ => 0.5,
+        }
+    } else {
+        0.55 // punctuation, unicode, etc.
+    }
+}
+
+/// Estimated rendered width of `text` at `size_px`, per [`char_width_fraction`]. `bold`
+/// applies a flat ~8% widening — a bold cut of a face is reliably wider than its regular
+/// cut at the same point size, which the estimate needs to account for since
+/// [`resolve_font_file`] switches to an actual bold font file when `font_weight` is bold.
+fn estimate_text_width_px(text: &str, size_px: f64, bold: bool) -> f64 {
+    let width: f64 = text.chars().map(|c| char_width_fraction(c) * size_px).sum();
+    if bold { width * 1.08 } else { width }
+}
+
 /// Greedily word-wraps `text` to fit `max_width_px` per line — ffmpeg's `drawtext` has no
 /// built-in auto-wrap (unlike Konva's `Text` with a `width` prop, which wraps using real
 /// measured glyph widths), so a long caption previously just drew as one line and ran past
-/// its own box/the frame edge regardless of `maxWidth`. `avg_char_width_px` is a rough
-/// per-character estimate (no font-shaping library here to measure real glyph widths) —
-/// good enough to keep captions inside their box without needing pixel-perfect wrapping.
-/// Existing `\n`s in the source text are preserved as hard paragraph breaks.
-fn wrap_caption_text(text: &str, max_width_px: f64, avg_char_width_px: f64) -> Vec<String> {
-    let max_chars = ((max_width_px / avg_char_width_px.max(1.0)).floor() as usize).max(1);
+/// its own box/the frame edge regardless of `maxWidth`. Existing `\n`s in the source text
+/// are preserved as hard paragraph breaks.
+fn wrap_caption_text(text: &str, max_width_px: f64, size_px: f64, bold: bool) -> Vec<String> {
+    let max_width_px = max_width_px.max(1.0);
+    let space_width = estimate_text_width_px(" ", size_px, bold);
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
         let mut current = String::new();
+        let mut current_width = 0.0_f64;
         for word in paragraph.split_whitespace() {
-            let candidate_len = if current.is_empty() { word.len() } else { current.len() + 1 + word.len() };
-            if candidate_len > max_chars && !current.is_empty() {
+            let word_width = estimate_text_width_px(word, size_px, bold);
+            let candidate_width = if current.is_empty() { word_width } else { current_width + space_width + word_width };
+            if candidate_width > max_width_px && !current.is_empty() {
                 lines.push(std::mem::take(&mut current));
+                current_width = 0.0;
             }
             if !current.is_empty() {
                 current.push(' ');
+                current_width += space_width;
             }
             current.push_str(word);
+            current_width += word_width;
         }
         lines.push(current);
     }
@@ -267,24 +373,40 @@ fn wrap_caption_text(text: &str, max_width_px: f64, avg_char_width_px: f64) -> V
     lines
 }
 
-/// Builds a `drawbox=...,drawtext=...` filter pair for a caption overlay — shared by the
-/// primary `caption` and the independent `caption2` overlay, which differ only in their
-/// own config values, not in how a caption gets burned in. Mirrors the Konva preview's
-/// layout exactly (`TemplateEditor.tsx`'s `Group`/`Rect`/`KonvaText`): a fixed `maxWidth`-wide
-/// box (not a text-width-dependent one — that was an earlier bug where `alignment` had no
-/// effect on the render) placed edge-relative per `position.{x,y}` (see below), with
-/// `alignment` placing the text horizontally inside that box.
-fn caption_drawtext_filter(cap: &CaptionConfig, output_width: u32, output_height: u32) -> String {
+/// Builds a `drawbox=...,drawtext=...` filter pair for a text overlay — shared by `caption`,
+/// `caption2`, and each subtitle cue, which differ only in their text and (for subtitles)
+/// an `enable_range` gating when that cue is visible, not in how a text box gets burned in.
+/// Mirrors the Konva preview's layout exactly (`TemplateEditor.tsx`'s `Group`/`Rect`/
+/// `KonvaText`): a fixed `maxWidth`-wide box (not a text-width-dependent one — that was an
+/// earlier bug where `alignment` had no effect on the render) placed edge-relative per
+/// `position.{x,y}` (see below), with `alignment` placing the text horizontally inside that
+/// box. `enable_range`, when set, gates both the box and the text to `[start, end)` seconds
+/// of the *output* stream's timeline (which `-ss` before `-i` already zeroes at the trim
+/// point — see `render_final`), so a subtitle cue only shows while its line is being said.
+#[allow(clippy::too_many_arguments)]
+fn build_text_box_filter(
+    text: &str,
+    font_family: &str,
+    font_size: f64,
+    font_weight: &str,
+    font_color: &str,
+    background_color: &str,
+    background_opacity: f64,
+    padding: f64,
+    position: &Point,
+    max_width: f64,
+    alignment: &str,
+    output_width: u32,
+    output_height: u32,
+    enable_range: Option<(f64, f64)>,
+) -> String {
     let font_scale = output_height as f64 / 1920.0;
-    let font_file = resolve_font_file(&cap.font_family, &cap.font_weight);
-    let size = (cap.font_size * font_scale).round() as i64;
-    let pad = cap.padding * font_scale;
-    let box_w = cap.max_width * font_scale;
-    // 0.55x font size is a typical average glyph width for a proportional sans/serif face —
-    // approximate (see wrap_caption_text's doc comment) but keeps captions from overflowing
-    // their box the way an un-wrapped single `drawtext` line previously did.
-    let avg_char_width = size as f64 * 0.55;
-    let wrapped_lines = wrap_caption_text(&cap.text, (box_w - pad * 2.0).max(1.0), avg_char_width);
+    let font_file = resolve_font_file(font_family, font_weight);
+    let size = (font_size * font_scale).round() as i64;
+    let pad = padding * font_scale;
+    let box_w = max_width * font_scale;
+    let bold = font_weight.eq_ignore_ascii_case("bold");
+    let wrapped_lines = wrap_caption_text(text, (box_w - pad * 2.0).max(1.0), size as f64, bold);
     let wrapped_text = wrapped_lines.join("\n");
     // ffmpeg's default line spacing (no `line_spacing` override) is close to 1.2x the font
     // size for most fonts — matches this box-height estimate closely enough to avoid the
@@ -301,30 +423,92 @@ fn caption_drawtext_filter(cap: &CaptionConfig, output_width: u32, output_height
     // already off-frame made "left/center/right" look like it had no effect at all — the
     // box's own placement, not the alignment math, was the actual bug. This also made the
     // live preview (already edge-relative) not match what ffmpeg actually rendered.
-    let box_x = cap.position.x * (output_width as f64 - box_w).max(0.0);
-    let box_y = cap.position.y * (output_height as f64 - box_h).max(0.0);
+    let box_x = position.x * (output_width as f64 - box_w).max(0.0);
+    let box_y = position.y * (output_height as f64 - box_h).max(0.0);
     // Positions the overall (possibly multi-line) text block — `text_w` is the widest
     // wrapped line's width, so this places that widest line as intended. `text_align` below
     // additionally aligns any *shorter* lines within that same block, which `x` alone can't
     // do since drawtext only evaluates one `x` expression for the whole block.
-    let text_x = match cap.alignment.as_str() {
+    let text_x = match alignment {
         "center" => format!("{box_x}+({box_w}-text_w)/2"),
         "right" => format!("{box_x}+{box_w}-text_w-{pad}"),
         _ => format!("{box_x}+{pad}"),
     };
-    let text_align = match cap.alignment.as_str() {
+    let text_align = match alignment {
         "center" => "center",
         "right" => "right",
         _ => "left",
     };
+    // Quoted (like `text='...'` below) so the comma-separated arguments inside don't get
+    // read as filter/chain separators by ffmpeg's filtergraph parser.
+    let enable = enable_range
+        .map(|(start, end)| format!(":enable='between(t,{start},{end})'"))
+        .unwrap_or_default();
     format!(
-        "drawbox=x={box_x}:y={box_y}:w={box_w}:h={box_h}:color={bg}@{bgop}:t=fill,drawtext=text='{text}':fontfile='{font}':fontsize={size}:fontcolor={color}:text_align={text_align}:x={text_x}:y={box_y}+({box_h}-text_h)/2",
+        "drawbox=x={box_x}:y={box_y}:w={box_w}:h={box_h}:color={bg}@{bgop}:t=fill{enable},drawtext=text='{text}':fontfile='{font}':fontsize={size}:fontcolor={color}:text_align={text_align}:x={text_x}:y={box_y}+({box_h}-text_h)/2{enable}",
         text = escape_drawtext(&wrapped_text),
         font = escape_drawtext(&font_file.to_string_lossy()),
-        color = cap.font_color,
-        bg = cap.background_color,
-        bgop = cap.background_opacity,
+        color = font_color,
+        bg = background_color,
+        bgop = background_opacity,
     )
+}
+
+/// Thin wrapper over [`build_text_box_filter`] for a fixed-text caption (`caption`/
+/// `caption2`) — no `enable_range`, so it's visible for the whole clip.
+fn caption_drawtext_filter(cap: &CaptionConfig, output_width: u32, output_height: u32) -> String {
+    build_text_box_filter(
+        &cap.text,
+        &cap.font_family,
+        cap.font_size,
+        &cap.font_weight,
+        &cap.font_color,
+        &cap.background_color,
+        cap.background_opacity,
+        cap.padding,
+        &cap.position,
+        cap.max_width,
+        &cap.alignment,
+        output_width,
+        output_height,
+        None,
+    )
+}
+
+/// Builds one `build_text_box_filter` call per subtitle cue, each gated to its own
+/// `[start, end)` window via `enable_range` so only one line (per overlapping cue) is ever
+/// on screen at a time. `cues` are already clip-relative and clamped to the clip's own
+/// duration — see `commands::render::render_clip_final_inner`, which reads the project's
+/// transcript and does that shifting before calling `render_final`. Empty/whitespace-only
+/// cue text is skipped rather than burning in a blank box.
+fn subtitle_drawtext_filters(
+    sub: &SubtitleConfig,
+    cues: &[(f64, f64, String)],
+    output_width: u32,
+    output_height: u32,
+) -> Vec<String> {
+    cues
+        .iter()
+        .filter(|(_, _, text)| !text.trim().is_empty())
+        .map(|(start, end, text)| {
+            build_text_box_filter(
+                text,
+                &sub.font_family,
+                sub.font_size,
+                &sub.font_weight,
+                &sub.font_color,
+                &sub.background_color,
+                sub.background_opacity,
+                sub.padding,
+                &sub.position,
+                sub.max_width,
+                &sub.alignment,
+                output_width,
+                output_height,
+                Some((*start, *end)),
+            )
+        })
+        .collect()
 }
 
 /// Resolves a font family name to an actual font file for drawtext's `fontfile=`. Using
@@ -368,6 +552,10 @@ pub fn render_final(
     start_seconds: f64,
     end_seconds: f64,
     template: &TemplateConfig,
+    // Transcript entries overlapping this clip, already shifted to clip-relative seconds by
+    // the caller (see `commands::render::render_clip_final_inner`). Ignored unless
+    // `template.subtitle.enabled`.
+    subtitle_cues: &[(f64, f64, String)],
     output_path: &Path,
 ) -> Result<(), String> {
     let ffmpeg = ffmpeg_path()?;
@@ -465,6 +653,13 @@ pub fn render_final(
         let drawtext = caption_drawtext_filter(&template.caption2, w, h);
         filters.push(format!("[{current}]{drawtext}[captioned2]"));
         current = "captioned2".to_string();
+    }
+    if template.subtitle.enabled && !subtitle_cues.is_empty() {
+        for (i, drawtext) in subtitle_drawtext_filters(&template.subtitle, subtitle_cues, w, h).into_iter().enumerate() {
+            let label = format!("sub{i}");
+            filters.push(format!("[{current}]{drawtext}[{label}]"));
+            current = label;
+        }
     }
 
     if template.encoding.max_resolution < h {

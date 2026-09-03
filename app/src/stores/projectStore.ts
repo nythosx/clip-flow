@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { playVoice, playSfx, playErrorVoiceDebounced } from "../lib/soundManager";
 
 export interface Project {
   id: string;
@@ -20,8 +21,17 @@ export interface Project {
   clipsCount: number;
   partsCount: number;
   trendingHashtags: string[];
+  transcriptOffsetSeconds: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface TranscriptSyncStatus {
+  movieDurationSeconds: number;
+  transcriptStartSeconds: number;
+  transcriptEndSeconds: number;
+  offsetSeconds: number;
+  mismatch: boolean;
 }
 
 export interface Clip {
@@ -46,7 +56,20 @@ export interface AnalysisProgress {
   mode: "clips" | "movie";
   stage: string;
   progress: number;
+  detail: string | null;
 }
+
+export interface ActivityLogEntry {
+  id: string;
+  projectId: string;
+  mode: string;
+  stage: string;
+  progress: number;
+  detail: string | null;
+  timestamp: number;
+}
+
+const MAX_ACTIVITY_LOG_ENTRIES = 500;
 
 interface ProjectStore {
   projects: Project[];
@@ -56,6 +79,8 @@ interface ProjectStore {
   error: string | null;
   clipsAnalysisProgress: AnalysisProgress | null;
   movieAnalysisProgress: AnalysisProgress | null;
+  activityLog: ActivityLogEntry[];
+  initActivityLogListener: () => void;
   fetchProjects: () => Promise<void>;
   createProject: (name: string, moviePath: string, transcriptPath: string) => Promise<string>;
   fetchProject: (projectId: string) => Promise<void>;
@@ -65,6 +90,8 @@ interface ProjectStore {
   cancelAnalysis: (projectId: string, mode: "clips" | "movie") => Promise<void>;
   deleteProject: (projectId: string) => Promise<void>;
   updateProjectName: (projectId: string, name: string) => Promise<void>;
+  getTranscriptSyncStatus: (projectId: string) => Promise<TranscriptSyncStatus>;
+  setTranscriptOffset: (projectId: string, offsetSeconds: number) => Promise<void>;
   renderClipPreview: (clipId: string) => Promise<void>;
   renderClipFinal: (clipId: string, templateId: string) => Promise<void>;
   // A Set, not a single id — rendering is now queued/serialized entirely on the backend
@@ -104,12 +131,15 @@ async function runAnalysis(
   set: (partial: Partial<ProjectStore>) => void,
   get: () => ProjectStore
 ) {
-  set({ error: null, [progressKey]: { projectId, mode, stage: "starting", progress: 0 } } as Partial<ProjectStore>);
+  set({
+    error: null,
+    [progressKey]: { projectId, mode, stage: "starting", progress: 0, detail: null },
+  } as Partial<ProjectStore>);
 
   const existingUnlisten = mode === "clips" ? clipsProgressUnlisten : movieProgressUnlisten;
   if (existingUnlisten) existingUnlisten();
   const unlisten = await listen<AnalysisProgress>("project_analysis_progress", (event) => {
-    if (event.payload.projectId === projectId && event.payload.mode === mode) {
+    if (event.payload.projectId === projectId && event.payload.mode === mode && event.payload.stage !== "ai_status") {
       set({ [progressKey]: event.payload } as Partial<ProjectStore>);
     }
   });
@@ -120,8 +150,10 @@ async function runAnalysis(
     await invoke(command, { id: projectId });
     await get().fetchProject(projectId);
     await get().fetchClips(projectId);
+    playVoice("analysisComplete");
   } catch (error) {
     set({ error: String(error) });
+    playErrorVoiceDebounced();
   } finally {
     set({ [progressKey]: null } as Partial<ProjectStore>);
     const unlistenNow = mode === "clips" ? clipsProgressUnlisten : movieProgressUnlisten;
@@ -133,6 +165,8 @@ async function runAnalysis(
   }
 }
 
+let activityLogListenerInitialized = false;
+
 export const useProjectStore = create<ProjectStore>((set, get) => ({
   projects: [],
   currentProject: null,
@@ -141,6 +175,26 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   error: null,
   clipsAnalysisProgress: null,
   movieAnalysisProgress: null,
+  activityLog: [],
+
+  initActivityLogListener: () => {
+    if (activityLogListenerInitialized) return;
+    activityLogListenerInitialized = true;
+    listen<AnalysisProgress>("project_analysis_progress", (event) => {
+      const p = event.payload;
+      const entry: ActivityLogEntry = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        projectId: p.projectId,
+        mode: p.mode,
+        stage: p.stage,
+        progress: p.progress,
+        detail: p.detail ?? null,
+        timestamp: Date.now(),
+      };
+      set({ activityLog: [...get().activityLog, entry].slice(-MAX_ACTIVITY_LOG_ENTRIES) });
+    });
+  },
+
   renderingClipIds: new Set(),
   generatingCaptionClipId: null,
   generatingCaptionsForProject: null,
@@ -226,6 +280,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     }
   },
 
+  getTranscriptSyncStatus: (projectId) => invoke<TranscriptSyncStatus>("get_transcript_sync_status", { projectId }),
+
+  setTranscriptOffset: async (projectId, offsetSeconds) => {
+    await invoke("set_transcript_offset", { projectId, offsetSeconds });
+    const project = await invoke<Project>("get_project", { id: projectId });
+    set({
+      projects: get().projects.map((p) => (p.id === projectId ? project : p)),
+      currentProject: get().currentProject?.id === projectId ? project : get().currentProject,
+    });
+  },
+
   renderVersion: {},
 
   renderClipPreview: async (clipId) => {
@@ -243,8 +308,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         ),
         renderVersion: { ...get().renderVersion, [clipId]: (get().renderVersion[clipId] ?? 0) + 1 },
       });
+      playSfx("success");
     } catch (error) {
       set({ error: String(error) });
+      playSfx("error");
     } finally {
       const next = new Set(get().renderingClipIds);
       next.delete(clipId);
@@ -260,8 +327,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
         clips: get().clips.map((c) => (c.id === clipId ? { ...c, finalOutputPath } : c)),
         renderVersion: { ...get().renderVersion, [clipId]: (get().renderVersion[clipId] ?? 0) + 1 },
       });
+      playSfx("success");
     } catch (error) {
       set({ error: String(error) });
+      playSfx("error");
     } finally {
       const next = new Set(get().renderingClipIds);
       next.delete(clipId);

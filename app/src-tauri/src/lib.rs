@@ -15,6 +15,17 @@ use queue_manager::QueueManager;
 use std::sync::Mutex;
 use tauri::Manager;
 
+#[tauri::command]
+fn close_splashscreen(app: tauri::AppHandle) {
+    if let Some(splash) = app.get_webview_window("splash") {
+        let _ = splash.close();
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // `log::info!`/`log::error!` calls throughout this codebase (ai_client.rs,
@@ -41,6 +52,22 @@ pub fn run() {
 
             app.manage(QueueManager::default());
             queue_manager::kick(app.handle().clone());
+            // Every other kick() trigger is reactive (an item was added, resumed, manually
+            // retried, ...) — nothing re-checks the queue purely because time has passed.
+            // A rate-limited item's automatic retry (schedule_rate_limit_retry) sets a
+            // future `scheduled_at` and otherwise just sits there until something calls
+            // kick() again; this periodic sweep is what actually makes that due retry fire
+            // on its own instead of requiring the user to open the app back up.
+            {
+                let periodic_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
+                    loop {
+                        interval.tick().await;
+                        queue_manager::kick(periodic_handle.clone());
+                    }
+                });
+            }
             app.manage(render_manager::RenderManager::default());
 
             app.manage(commands::project::AnalysisRegistry::default());
@@ -50,14 +77,38 @@ pub fn run() {
             app.manage(commands::youtube::DownloadManager::default());
             app.manage(commands::facebook::FacebookOAuthState::default());
 
+            // Main window starts hidden (tauri.conf.json) so the user never sees a blank
+            // white frame while React mounts and the initial data fetches resolve — this
+            // splash window covers that gap instead, and close_splashscreen swaps them.
+            tauri::WebviewWindowBuilder::new(app, "splash", tauri::WebviewUrl::App("splash.html".into()))
+                .title("ClipFlow")
+                .inner_size(360.0, 420.0)
+                .resizable(false)
+                .decorations(false)
+                .center()
+                .always_on_top(true)
+                .build()?;
+
+            // Safety net: if the frontend never calls close_splashscreen (crashed before
+            // mounting, stuck fetch, etc.) don't leave the user staring at the splash
+            // forever — reveal the main window anyway after a generous timeout.
+            let fallback_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                close_splashscreen(fallback_handle);
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            close_splashscreen,
             commands::project::create_project,
             commands::project::get_projects,
             commands::project::get_project,
             commands::project::get_clips,
             commands::project::update_project_name,
+            commands::project::get_transcript_sync_status,
+            commands::project::set_transcript_offset,
             commands::project::delete_project,
             commands::project::set_project_thumbnail,
             commands::project::update_clip_caption,
@@ -73,6 +124,7 @@ pub fn run() {
             commands::render::render_clip_final,
             commands::render::get_thumbnail,
             commands::render::get_render_queue,
+            commands::render::get_clip_subtitle_cues,
             commands::template::create_template,
             commands::template::get_templates,
             commands::template::get_template,
@@ -85,6 +137,7 @@ pub fn run() {
             commands::account::get_accounts,
             commands::account::delete_account,
             commands::account::connect_tiktok_account,
+            commands::account::open_platform_browser,
             commands::youtube::connect_youtube_account,
             commands::youtube::refresh_youtube_account,
             commands::youtube::youtube_search,

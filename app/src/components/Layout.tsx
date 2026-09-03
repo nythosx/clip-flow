@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { NavLink, Outlet } from "react-router-dom";
 import { FolderKanban, LayoutTemplate, Users, ListChecks, Settings as SettingsIcon, Film, Clapperboard, Download, WifiOff, Loader2 } from "lucide-react";
 import { useDownloadsStore } from "../stores/downloadsStore";
@@ -33,6 +34,14 @@ export default function Layout() {
     initOnlineListeners();
     initRenderQueueListeners();
     fetchRenderQueue();
+
+    // Keep the splash animation on screen for at least this long so it doesn't just flash
+    // by on a fast machine — the main window (hidden until now, see tauri.conf.json) swaps
+    // in once this fires.
+    const timer = setTimeout(() => {
+      invoke("close_splashscreen").catch(() => {});
+    }, 1200);
+    return () => clearTimeout(timer);
   }, [initListeners, fetchDownloads, initOnlineListeners, initRenderQueueListeners, fetchRenderQueue]);
 
   return (

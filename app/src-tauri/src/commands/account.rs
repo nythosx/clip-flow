@@ -173,3 +173,20 @@ pub async fn connect_tiktok_account(
     conn.query_row("SELECT * FROM accounts WHERE id = ?1", params![id], row_to_account)
         .map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn open_platform_browser(app: AppHandle, label: String, url: String, title: String) -> Result<(), String> {
+    use tauri::Manager;
+
+    if let Some(existing) = app.get_webview_window(&label) {
+        existing.set_focus().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::External(url.parse().map_err(|e| format!("invalid URL: {e}"))?))
+        .title(title)
+        .inner_size(1200.0, 850.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}

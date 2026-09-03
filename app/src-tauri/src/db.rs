@@ -191,9 +191,27 @@ pub fn open(app_data_dir: &PathBuf) -> rusqlite::Result<Connection> {
         Err(e) if e.to_string().contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
-    // Same stale-row recovery as upload_queue above — a row left "rendering" from a
-    // previous crash/close would otherwise sit stuck forever since nothing re-kicks it.
-    conn.execute_batch("UPDATE render_queue SET status = 'queued' WHERE status = 'rendering';")?;
+    // Unlike upload_queue, render_queue has no independent background worker — a
+    // 'queued'/'rendering' row only ever progresses because the original
+    // render_clip_preview/render_clip_final call that inserted it is still awaiting inside
+    // this same process (render_manager.rs). Any such row still present when the app starts
+    // up must be left over from a previous process that was closed or crashed mid-render —
+    // nothing will ever pick it back up. Resetting it to 'queued' (as if requeuing it, the
+    // upload_queue pattern) was actively wrong here: the row just sat there forever with no
+    // real work behind it, keeping the render-queue indicator spinning indefinitely. Mark it
+    // failed instead so it clears; re-selecting/re-rendering the clip starts a fresh row.
+    conn.execute_batch(
+        "UPDATE render_queue SET status = 'failed', error_message = 'Interrupted — app was closed or restarted while this was rendering', completed_at = datetime('now') WHERE status IN ('queued', 'rendering');",
+    )?;
+    // Manual correction for a transcript whose timestamps don't line up with the actual
+    // movie file (wrong export, extra intro/logo not in the transcript, etc.) — applied to
+    // every transcript entry's start/end before it's used for subtitle cues, so the
+    // in-app preview and the final render both shift in lockstep. See transcript_sync.rs.
+    match conn.execute_batch("ALTER TABLE projects ADD COLUMN transcript_offset_seconds REAL NOT NULL DEFAULT 0;") {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("duplicate column name") => {}
+        Err(e) => return Err(e),
+    }
     seed_default_template(&conn)?;
     Ok(conn)
 }

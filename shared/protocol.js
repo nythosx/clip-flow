@@ -22,6 +22,11 @@ const AI_MESSAGE_TYPES = {
   MOVIE_SEGMENTER: 'movie_segmenter', // -> { requestId, sessionKey?, transcript, duration }
   MOVIE_SEGMENTER_RESULT: 'movie_segmenter_result', // <- { requestId, parts: [{start,end}] }
   AI_ERROR: 'ai_error', // <- { requestId, error }
+  // Non-terminal progress narration for one in-flight AI call — zero or more of these can
+  // be sent for a given requestId before its actual result/ai_error arrives. Purely
+  // informational (e.g. "opening a new AI chat tab", "waiting for the response"): the
+  // caller must keep waiting for the real result regardless of how many of these it gets.
+  AI_STATUS: 'ai_status', // <- { requestId, message }
   CAPTCHA_DETECTED: 'captcha_detected', // <- (no requestId — global, user must intervene)
   CLOSE_SESSION: 'close_session', // -> { requestId, sessionKey }
   SESSION_CLOSED: 'session_closed', // <- { requestId, closed, reason? }

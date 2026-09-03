@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { useProjectStore } from "./projectStore";
 import { useQueueStore } from "./queueStore";
+import { playVoice, playErrorVoiceDebounced } from "../lib/soundManager";
 
 export interface AutoUploadSettings {
   mode: "clips" | "movie";
@@ -110,6 +111,10 @@ export const useAutoUploadStore = create<AutoUploadStore>((set, get) => ({
           await queueStore.addToQueue(clip.id, missing);
         }
       }
+      playVoice("autoUploadComplete");
+    } catch (error) {
+      playErrorVoiceDebounced();
+      throw error;
     } finally {
       set({ running: false, progressLabel: "" });
     }

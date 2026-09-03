@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { playSfx, playVoice } from "../lib/soundManager";
 
 export interface QueueItem {
   id: string;
@@ -18,6 +19,8 @@ export interface QueueItem {
   scheduledAt: string | null;
   completedAt: string | null;
   createdAt: string;
+  title: string;
+  hashtags: string[];
 }
 
 interface UploadProgressEvent {
@@ -43,6 +46,10 @@ interface QueueStore {
 }
 
 let listenersInitialized = false;
+// Tracks whether a batch of uploads is actually "in flight" so the uploadsDone voice line
+// fires once when the queue drains, not on every individual item (that's what the per-item
+// success/error SFX below is for) and not on app startup when the queue simply starts empty.
+let hadActiveUploads = false;
 
 export const useQueueStore = create<QueueStore>((set, get) => ({
   items: [],
@@ -56,11 +63,22 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
     listen<UploadProgressEvent>("upload_progress", (event) => {
       const { id, progress, status } = event.payload;
-      set({
-        items: get().items.map((item) =>
-          item.id === id ? { ...item, progress, status } : item
-        ),
-      });
+      const previousStatus = get().items.find((item) => item.id === id)?.status;
+      const nextItems = get().items.map((item) => (item.id === id ? { ...item, progress, status } : item));
+      set({ items: nextItems });
+
+      // Per-item SFX — only on the transition into a terminal state, not on every progress
+      // tick (progress updates keep the same "uploading" status) and not on a rate-limit
+      // reschedule (that sets status back to "queued", not "failed").
+      if (status === "completed" && previousStatus !== "completed") playSfx("success");
+      if (status === "failed" && previousStatus !== "failed") playSfx("error");
+
+      if (status === "uploading") hadActiveUploads = true;
+      const stillActive = nextItems.some((item) => item.status === "queued" || item.status === "uploading");
+      if (hadActiveUploads && !stillActive && nextItems.some((item) => item.status === "completed")) {
+        hadActiveUploads = false;
+        playVoice("uploadsDone");
+      }
     });
     listen("queue_paused", () => set({ isPaused: true }));
     listen("queue_resumed", () => set({ isPaused: false }));

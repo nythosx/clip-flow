@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ClipFlow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#18181b;
+    --bg-soft:#1f2024;
+    --teal:#0d949c;
+    --cyan:#22d3db;
+    --white:#ffffff;
+    --orange:#ffb92d;
+    --orange-deep:#f79420;
+    --text-dim: rgba(255,255,255,0.38);
+  }
+
+  *{ box-sizing:border-box; }
+
+  html,body{
+    margin:0;
+    padding:0;
+    width:100%;
+    height:100%;
+    background:var(--bg);
+    overflow:hidden;
+    font-family:'Inter', sans-serif;
+  }
+
+  .stage{
+    position:relative;
+    width:100%;
+    height:100vh;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    background:
+      radial-gradient(circle at 50% 38%, rgba(34,211,219,0.10), transparent 55%),
+      radial-gradient(circle at 50% 90%, rgba(13,148,156,0.08), transparent 60%),
+      var(--bg);
+  }
+
+  /* ambient drifting clip chips */
+  .chip{
+    position:absolute;
+    border-radius:6px;
+    opacity:0;
+    animation: drift 7s ease-in-out infinite;
+  }
+
+  /* ============ LOGO ============ */
+  .logo-wrap{
+    position:relative;
+    width:220px;
+    height:220px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+  }
+
+  .card{
+    position:absolute;
+    border-radius:34px;
+    width:150px;
+    height:194px;
+  }
+
+  .card-teal{
+    background: linear-gradient(160deg, #12a3ac 0%, #0a7a80 100%);
+    transform: translate(-38px, 4px) rotate(-16deg);
+    opacity:0;
+    animation: fallTeal 0.9s cubic-bezier(.2,.9,.25,1.2) 0.15s forwards;
+  }
+
+  .card-cyan{
+    background: linear-gradient(160deg, #35e2e9 0%, #17c3cb 100%);
+    transform: translate(38px, 4px) rotate(14deg);
+    opacity:0;
+    animation: fallCyan 0.9s cubic-bezier(.2,.9,.25,1.2) 0.35s forwards;
+  }
+
+  .card-white{
+    background: var(--white);
+    width:160px;
+    height:210px;
+    border-radius:36px;
+    opacity:0;
+    transform: translateY(0) scale(0.5);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+    animation: popWhite 0.7s cubic-bezier(.34,1.56,.64,1) 0.62s forwards;
+  }
+
+  .play{
+    width:0;
+    height:0;
+    border-top: 34px solid transparent;
+    border-bottom: 34px solid transparent;
+    border-left: 52px solid var(--orange);
+    margin-left:10px;
+    filter: drop-shadow(0 6px 14px rgba(255,185,45,0.45));
+    opacity:0;
+    transform: scale(0.4);
+    animation: popPlay 0.55s cubic-bezier(.34,1.56,.64,1) 1.05s forwards;
+  }
+
+  .ring{
+    position:absolute;
+    width:160px;
+    height:210px;
+    border-radius:36px;
+    border:2px solid rgba(34,211,219,0.6);
+    opacity:0;
+  }
+
+  .ring-loop{
+    animation: ripple 2.6s ease-out 1.6s infinite;
+  }
+
+  @keyframes fallTeal{
+    0%   { opacity:0; transform: translate(-90px,-70px) rotate(-40deg) scale(0.6); }
+    100% { opacity:1; transform: translate(-38px,4px) rotate(-16deg) scale(1); }
+  }
+  @keyframes fallCyan{
+    0%   { opacity:0; transform: translate(90px,-70px) rotate(46deg) scale(0.6); }
+    100% { opacity:1; transform: translate(38px,4px) rotate(14deg) scale(1); }
+  }
+  @keyframes popWhite{
+    0%   { opacity:0; transform: translateY(10px) scale(0.4) rotate(-6deg); }
+    70%  { opacity:1; transform: translateY(-4px) scale(1.04) rotate(0deg); }
+    100% { opacity:1; transform: translateY(0) scale(1) rotate(0deg); }
+  }
+  @keyframes popPlay{
+    0%   { opacity:0; transform: scale(0.3); }
+    70%  { opacity:1; transform: scale(1.15); }
+    100% { opacity:1; transform: scale(1); }
+  }
+  @keyframes ripple{
+    0%   { opacity:0.55; transform: scale(1); }
+    100% { opacity:0; transform: scale(1.35); }
+  }
+
+  @keyframes drift{
+    0%   { opacity:0; transform: translateY(20px) rotate(0deg); }
+    15%  { opacity:0.35; }
+    85%  { opacity:0.15; }
+    100% { opacity:0; transform: translateY(-160px) rotate(12deg); }
+  }
+
+  /* ============ WORDMARK ============ */
+  .brand{
+    margin-top:38px;
+    opacity:0;
+    animation: riseIn 0.7s ease 1.15s forwards;
+    text-align:center;
+  }
+
+  .brand h1{
+    margin:0;
+    font-family:'Outfit', sans-serif;
+    font-weight:700;
+    font-size:2.4rem;
+    letter-spacing:0.5px;
+    color:var(--white);
+  }
+
+  .brand h1 span{
+    background: linear-gradient(90deg, var(--cyan), var(--orange));
+    -webkit-background-clip:text;
+    background-clip:text;
+    color:transparent;
+  }
+
+  .brand h1 .auto{
+    color: var(--text-dim);
+    font-weight:500;
+  }
+
+  @keyframes riseIn{
+    from{ opacity:0; transform: translateY(14px); }
+    to  { opacity:1; transform: translateY(0); }
+  }
+
+  @media (max-width:420px){
+    .logo-wrap{ width:180px; height:180px; }
+    .card{ width:122px; height:158px; }
+    .card-white{ width:130px; height:172px; border-radius:30px; }
+    .play{ border-top-width:26px; border-bottom-width:26px; border-left-width:40px; }
+    .brand h1{ font-size:1.9rem; }
+  }
+
+  @media (prefers-reduced-motion: reduce){
+    *{ animation-duration: 0.01ms !important; animation-iteration-count:1 !important; }
+  }
+</style>
+</head>
+<body>
+
+  <div class="stage" id="stage">
+
+    <div class="logo-wrap">
+      <div class="card card-teal"></div>
+      <div class="card card-cyan"></div>
+      <div class="ring ring-loop"></div>
+      <div class="card-white">
+        <div class="play"></div>
+      </div>
+    </div>
+
+    <div class="brand">
+      <h1>Clip<span>Flow</span><span class="auto">Auto</span></h1>
+    </div>
+
+  </div>
+
+<script>
+  // ambient floating clip chips behind the logo
+  const stage = document.getElementById('stage');
+  const colors = ['#0d949c','#22d3db','#ffb92d'];
+  const count = 10;
+  for(let i=0;i<count;i++){
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    const size = 10 + Math.random()*14;
+    chip.style.width = size + 'px';
+    chip.style.height = (size*0.7) + 'px';
+    chip.style.background = colors[i % colors.length];
+    chip.style.left = (10 + Math.random()*80) + '%';
+    chip.style.top = (55 + Math.random()*35) + '%';
+    chip.style.animationDelay = (Math.random()*7) + 's';
+    chip.style.animationDuration = (6 + Math.random()*4) + 's';
+    stage.appendChild(chip);
+  }
+</script>
+
+</body>
+</html>

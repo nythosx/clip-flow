@@ -55,6 +55,33 @@ fn split_blocks(content: &str) -> Vec<Vec<&str>> {
         .collect()
 }
 
+/// Strips inline markup — WebVTT/SRT text lines commonly carry styling tags like `<i>`,
+/// `<b>`, `<font color="...">`, `<c.classname>`, or per-word timestamp tags like
+/// `<00:00:01.000>` — and decodes the handful of HTML entities exported alongside them.
+/// Without this, burning the raw text into the frame (or showing it in the in-app preview)
+/// puts literal "<i>"/"&amp;" on screen instead of the styling/character it represents.
+fn strip_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+        .trim()
+        .to_string()
+}
+
 fn parse_srt(content: &str) -> Vec<TranscriptEntry> {
     let normalized = normalize_line_endings(content);
     let mut entries = Vec::new();
@@ -64,7 +91,7 @@ fn parse_srt(content: &str) -> Vec<TranscriptEntry> {
         // line rather than assuming it's always line 1.)
         let Some(ts_line_idx) = block.iter().position(|l| l.contains("-->")) else { continue };
         let Some((start, end)) = parse_timestamp_range(block[ts_line_idx]) else { continue };
-        let text = block[ts_line_idx + 1..].join("\n").trim().to_string();
+        let text = strip_markup(&block[ts_line_idx + 1..].join("\n"));
         if !text.is_empty() {
             entries.push(TranscriptEntry { start, end, text });
         }
@@ -80,7 +107,7 @@ fn parse_vtt(content: &str) -> Vec<TranscriptEntry> {
     for block in split_blocks(&normalized) {
         let Some(ts_line_idx) = block.iter().position(|l| l.contains("-->")) else { continue };
         let Some((start, end)) = parse_timestamp_range(block[ts_line_idx]) else { continue };
-        let text = block[ts_line_idx + 1..].join("\n").trim().to_string();
+        let text = strip_markup(&block[ts_line_idx + 1..].join("\n"));
         if !text.is_empty() {
             entries.push(TranscriptEntry { start, end, text });
         }
@@ -121,7 +148,8 @@ fn parse_plain(content: &str) -> Vec<TranscriptEntry> {
     normalize_line_endings(content)
         .lines()
         .filter_map(parse_plain_line)
-        .map(|(start, text)| TranscriptEntry { start, end: start, text })
+        .map(|(start, text)| TranscriptEntry { start, end: start, text: strip_markup(&text) })
+        .filter(|e| !e.text.is_empty())
         .collect()
 }
 
@@ -139,6 +167,47 @@ pub fn detect_format(path: &Path, content: &str) -> TranscriptFormat {
     } else {
         TranscriptFormat::Plain
     }
+}
+
+/// Shifts every entry's start/end by a constant `offset_seconds` (positive = later, negative
+/// = earlier) — the manual correction for a transcript that's out of sync with the movie
+/// file it's paired with (see commands::project::get_transcript_sync_status /
+/// set_transcript_offset). Clamped at 0 rather than going negative.
+pub fn apply_offset(entries: &mut [TranscriptEntry], offset_seconds: f64) {
+    for entry in entries.iter_mut() {
+        entry.start = (entry.start + offset_seconds).max(0.0);
+        entry.end = (entry.end + offset_seconds).max(0.0);
+    }
+}
+
+/// Transcript entries overlapping `[clip_start, clip_end)`, shifted to clip-relative
+/// seconds — shared by the final-render subtitle burn-in (ffmpeg drawtext `enable` windows)
+/// and the in-app live preview (time-gated by the `<video>`'s currentTime), so both agree on
+/// exactly which line is on screen at a given instant.
+pub fn compute_cues(entries: &[TranscriptEntry], clip_start: f64, clip_end: f64) -> Vec<(f64, f64, String)> {
+    let mut entries = entries.to_vec();
+    entries.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let n = entries.len();
+    (0..n)
+        .filter_map(|i| {
+            let entry = &entries[i];
+            // Plain-text transcripts have no real end timestamp — every entry comes out
+            // with `end == start`. Display it until the next line starts (capped at 6s so
+            // a long silent gap doesn't leave a stale line on screen) instead.
+            let effective_end = if entry.end > entry.start {
+                entry.end
+            } else {
+                let next_start = entries.get(i + 1).map(|next| next.start);
+                next_start.map(|s| s.min(entry.start + 6.0)).unwrap_or(entry.start + 6.0)
+            };
+            if effective_end <= clip_start || entry.start >= clip_end {
+                return None;
+            }
+            let shifted_start = (entry.start - clip_start).max(0.0);
+            let shifted_end = (effective_end - clip_start).min(clip_end - clip_start);
+            Some((shifted_start, shifted_end.max(shifted_start + 0.05), entry.text.clone()))
+        })
+        .collect()
 }
 
 /// Formats seconds as "HH:MM:SS" — the timestamp shape SPEC.md's AI prompts use.

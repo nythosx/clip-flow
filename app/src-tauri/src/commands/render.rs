@@ -1,7 +1,9 @@
 use crate::db::Db;
 use crate::ffmpeg;
 use crate::render_manager::{self, RenderManager};
+use crate::transcript;
 use rusqlite::params;
+use std::path::Path;
 use tauri::{AppHandle, Manager, State};
 
 /// Extracts a clip's time range from its parent project's movie file into
@@ -92,22 +94,24 @@ async fn render_clip_final_inner(
     clip_id: &str,
     template_id: &str,
 ) -> Result<String, String> {
-    let (movie_path, start_seconds, end_seconds, ai_caption, part_number, config_json) = {
+    let (movie_path, start_seconds, end_seconds, ai_caption, part_number, config_json, transcript_path, transcript_offset_seconds) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let (movie_path, start_seconds, end_seconds, ai_caption, project_id, kind): (
+        let (movie_path, start_seconds, end_seconds, ai_caption, project_id, kind, transcript_path, transcript_offset_seconds): (
             String,
             f64,
             f64,
             Option<String>,
             String,
             String,
+            Option<String>,
+            f64,
         ) = conn
             .query_row(
-                "SELECT p.movie_path, c.start_seconds, c.end_seconds, c.ai_caption, c.project_id, c.kind
+                "SELECT p.movie_path, c.start_seconds, c.end_seconds, c.ai_caption, c.project_id, c.kind, p.transcript_path, p.transcript_offset_seconds
                  FROM clips c JOIN projects p ON p.id = c.project_id
                  WHERE c.id = ?1",
                 params![clip_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
             )
             .map_err(|e| e.to_string())?;
         // 1-based rank of this clip among same-project, same-kind siblings ordered by
@@ -126,7 +130,7 @@ async fn render_clip_final_inner(
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
-        (movie_path, start_seconds, end_seconds, ai_caption, part_number, config_json)
+        (movie_path, start_seconds, end_seconds, ai_caption, part_number, config_json, transcript_path, transcript_offset_seconds)
     };
 
     let mut template: ffmpeg::TemplateConfig =
@@ -143,13 +147,31 @@ async fn render_clip_final_inner(
     template.caption.text = resolve(&template.caption.text);
     template.caption2.text = resolve(&template.caption2.text);
 
+    // Transcript entries overlapping this clip's time range, shifted from the movie's
+    // absolute timeline to clip-relative seconds — `-ss` before `-i` in render_final already
+    // zeroes ffmpeg's own `t` at the trim point, so `drawtext`'s `enable=between(t,...)` for
+    // each cue needs to agree with that same zero point. Silently empty (not an error) when
+    // there's no transcript, or subtitles are off — most templates won't use this track.
+    let subtitle_cues: Vec<(f64, f64, String)> = if template.subtitle.enabled {
+        transcript_path
+            .as_deref()
+            .and_then(|path| transcript::parse_transcript(Path::new(path)).ok())
+            .map(|(_, mut entries)| {
+                transcript::apply_offset(&mut entries, transcript_offset_seconds);
+                transcript::compute_cues(&entries, start_seconds, end_seconds)
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let output_path = app_data_dir
         .join("renders")
         .join("final")
         .join(format!("{clip_id}_{template_id}.mp4"));
 
-    ffmpeg::render_final(&movie_path, start_seconds, end_seconds, &template, &output_path)?;
+    ffmpeg::render_final(&movie_path, start_seconds, end_seconds, &template, &subtitle_cues, &output_path)?;
 
     let output_path_str = output_path.to_string_lossy().to_string();
     {
@@ -191,4 +213,40 @@ pub async fn get_thumbnail(
 #[tauri::command]
 pub async fn get_render_queue(db: State<'_, Db>) -> Result<Vec<render_manager::RenderQueueItem>, String> {
     render_manager::get_queue(&db)
+}
+
+#[derive(serde::Serialize)]
+pub struct SubtitleCueDto {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+/// Same clip-relative cue timing `render_final` burns into the video (via
+/// `transcript::compute_cues`), exposed to the frontend so the in-app live preview (the
+/// raw-trim CSS overlay, before a real render exists) can show the same subtitle lines at
+/// the same instants instead of only showing them once uploaded. Empty (not an error) when
+/// the project has no transcript.
+#[tauri::command]
+pub async fn get_clip_subtitle_cues(db: State<'_, Db>, clip_id: String) -> Result<Vec<SubtitleCueDto>, String> {
+    let (start_seconds, end_seconds, transcript_path, transcript_offset_seconds): (f64, f64, Option<String>, f64) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT c.start_seconds, c.end_seconds, p.transcript_path, p.transcript_offset_seconds
+             FROM clips c JOIN projects p ON p.id = c.project_id
+             WHERE c.id = ?1",
+            params![clip_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let Some(transcript_path) = transcript_path else { return Ok(Vec::new()) };
+    let Ok((_, mut entries)) = transcript::parse_transcript(Path::new(&transcript_path)) else {
+        return Ok(Vec::new());
+    };
+    transcript::apply_offset(&mut entries, transcript_offset_seconds);
+    Ok(transcript::compute_cues(&entries, start_seconds, end_seconds)
+        .into_iter()
+        .map(|(start, end, text)| SubtitleCueDto { start, end, text })
+        .collect())
 }

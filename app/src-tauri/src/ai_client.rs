@@ -38,6 +38,13 @@ fn port_file() -> PathBuf {
 pub struct AiClient {
     outgoing: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
+    // requestId -> narration sink, registered by a caller (call_ai_tracked) BEFORE issuing
+    // the call so it can turn the extension's non-terminal "ai_status" pings (see
+    // shared/protocol.js's AI_STATUS doc comment) into a live activity-log entry instead of
+    // the caller only finding out once the whole multi-minute call finishes. Separate from
+    // `pending` since a oneshot::Sender can only ever fire once, but a single call can emit
+    // several of these before its real result arrives.
+    status_subs: Mutex<HashMap<String, mpsc::UnboundedSender<String>>>,
 }
 
 impl AiClient {
@@ -45,7 +52,19 @@ impl AiClient {
         Arc::new(Self {
             outgoing: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            status_subs: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Registers a narration sink for `request_id` — must be called before `call_ai`/
+    /// `call_ai_default_timeout` for that same request_id, since status pings can arrive
+    /// any time after the request is sent. The returned receiver stays open until the
+    /// caller drops it; `call_ai` unregisters the sender side once the call itself resolves
+    /// (success, error, or timeout) so nothing leaks across calls.
+    pub async fn subscribe_status(&self, request_id: &str) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.status_subs.lock().await.insert(request_id.to_string(), tx);
+        rx
     }
 
     /// Binds the WS server, writes the port file, and spawns the accept loop in the
@@ -131,13 +150,25 @@ impl AiClient {
             log::warn!("[ai_client] message with no requestId: {value}");
             return;
         };
+
+        let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if msg_type == "ai_status" {
+            // Non-terminal — never touches `pending`, since the real result/ai_error for
+            // this request_id is still coming.
+            if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
+                if let Some(sender) = self.status_subs.lock().await.get(request_id) {
+                    let _ = sender.send(message.to_string());
+                }
+            }
+            return;
+        }
+
         let mut pending = self.pending.lock().await;
         let Some(sender) = pending.remove(request_id) else {
             return; // no one waiting (already timed out, or a stray/duplicate message)
         };
         drop(pending);
 
-        let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if msg_type == "ai_error" {
             let error = value.get("error").and_then(|v| v.as_str()).unwrap_or("unknown AI error").to_string();
             let _ = sender.send(Err(error));
@@ -171,17 +202,23 @@ impl AiClient {
         let text = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
         if outgoing.send(Message::Text(text)).is_err() {
             self.pending.lock().await.remove(&request_id);
+            self.status_subs.lock().await.remove(&request_id);
             return Err("AI Engine connection closed while sending request".to_string());
         }
 
-        match tokio::time::timeout(timeout, rx).await {
+        let result = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("AI Engine dropped the request".to_string()),
             Err(_) => {
                 self.pending.lock().await.remove(&request_id);
                 Err(format!("AI Engine call timed out after {}s", timeout.as_secs()))
             }
-        }
+        };
+        // Whichever subscribe_status receiver was registered for this call is done hearing
+        // about it either way — drop the sender so a leftover status ping after this point
+        // (a stray/duplicate message) has nowhere to go instead of silently accumulating.
+        self.status_subs.lock().await.remove(&request_id);
+        result
     }
 
     pub async fn call_ai_default_timeout(&self, payload: Value) -> Result<Value, String> {

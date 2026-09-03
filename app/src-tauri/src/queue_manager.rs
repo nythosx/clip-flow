@@ -20,6 +20,31 @@ pub struct QueueManager {
     /// account_ids with an upload currently in flight — enforces the SPEC's default of
     /// one concurrent upload per account.
     active_accounts: Arc<Mutex<HashSet<String>>>,
+    /// Earliest instant the next TikTok API call is allowed to start — a shared throttle
+    /// across every TikTok account, not just per-account, since a 429 from
+    /// `rate_limit_exceeded` looks like an app/client-level limit rather than a per-user
+    /// one: several accounts publishing at the same moment (e.g. right after Auto Upload
+    /// queues a batch) could burst past it even though each account is individually
+    /// serialized. See `wait_tiktok_slot`.
+    tiktok_gate: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+// Minimum spacing enforced between the *start* of consecutive TikTok API calls (init,
+// chunk upload, status poll) across all accounts — cheap insurance against bursting the
+// rate limit; small enough not to meaningfully slow a single upload.
+const TIKTOK_MIN_CALL_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Blocks until at least `TIKTOK_MIN_CALL_INTERVAL` has passed since the last call any
+/// TikTok job (for any account) made through this gate, then reserves the next slot.
+async fn wait_tiktok_slot(manager: &QueueManager) {
+    let mut next_slot = manager.tiktok_gate.lock().await;
+    let now = std::time::Instant::now();
+    if let Some(slot) = *next_slot {
+        if slot > now {
+            tokio::time::sleep(slot - now).await;
+        }
+    }
+    *next_slot = Some(std::time::Instant::now() + TIKTOK_MIN_CALL_INTERVAL);
 }
 
 /// Prefixed onto an `upload_queue.error_message` when `run_job` determined the failure was
@@ -78,8 +103,13 @@ pub fn kick(app: AppHandle) {
             Ok(c) => c,
             Err(_) => return,
         };
+        // scheduled_at is set by schedule_rate_limit_retry to back a 429'd item off into
+        // the future — excluding not-yet-due rows here is what makes that backoff actually
+        // wait instead of getting immediately re-picked-up by the next kick().
         let mut stmt = match conn.prepare(
-            "SELECT id, account_id, clip_id FROM upload_queue WHERE status = 'queued' ORDER BY created_at ASC",
+            "SELECT id, account_id, clip_id FROM upload_queue
+             WHERE status = 'queued' AND (scheduled_at IS NULL OR scheduled_at <= datetime('now'))
+             ORDER BY created_at ASC",
         ) {
             Ok(s) => s,
             Err(_) => return,
@@ -154,12 +184,17 @@ async fn run_job(app: AppHandle, item_id: String, account_id: String, clip_id: S
             emit_progress(&app, &item_id, &account_id, 100, "completed");
         }
         Err(e) => {
-            // Tag connectivity failures distinctly (rather than a platform actually
-            // rejecting the post) so the frontend can auto-retry just these once it sees
-            // the connection come back — see `retry_offline_failures` / OFFLINE_ERROR_PREFIX.
-            let message = if is_connectivity_error(&e) { format!("{OFFLINE_ERROR_PREFIX}{e}") } else { e };
-            set_failed(&app, &item_id, &message);
-            emit_progress(&app, &item_id, &account_id, 0, "failed");
+            if let Some((retry_after, human)) = parse_rate_limit(&e) {
+                let rescheduled = schedule_rate_limit_retry(&app, &item_id, retry_after, &human);
+                emit_progress(&app, &item_id, &account_id, 0, if rescheduled { "queued" } else { "failed" });
+            } else {
+                // Tag connectivity failures distinctly (rather than a platform actually
+                // rejecting the post) so the frontend can auto-retry just these once it sees
+                // the connection come back — see `retry_offline_failures` / OFFLINE_ERROR_PREFIX.
+                let message = if is_connectivity_error(&e) { format!("{OFFLINE_ERROR_PREFIX}{e}") } else { e };
+                set_failed(&app, &item_id, &message);
+                emit_progress(&app, &item_id, &account_id, 0, "failed");
+            }
         }
     }
 
@@ -244,7 +279,10 @@ async fn run_tiktok_job(app: &AppHandle, item_id: &str, account_id: &str, clip_i
         (path, build_tiktok_title(&project_name, &hashtags_json, &trending_json))
     };
 
+    let manager = app.state::<QueueManager>();
+
     emit_progress(app, item_id, account_id, 15, "uploading");
+    wait_tiktok_slot(&manager).await;
     let init = tiktok_api::init_video_publish(&creds.access_token, &PathBuf::from(&video_path), &title).await?;
 
     emit_progress(app, item_id, account_id, 30, "uploading");
@@ -256,6 +294,7 @@ async fn run_tiktok_job(app: &AppHandle, item_id: &str, account_id: &str, clip_i
     // status. 30 attempts * 2s covers TikTok's typical processing time for short clips;
     // if it's still not done by then, surface a timeout rather than hanging the queue.
     for attempt in 0..30 {
+        wait_tiktok_slot(&manager).await;
         match tiktok_api::fetch_publish_status(&creds.access_token, &init.publish_id).await? {
             tiktok_api::PublishStatus::Complete => {
                 let db = app.state::<Db>();
@@ -338,15 +377,14 @@ async fn run_facebook_job(app: &AppHandle, item_id: &str, account_id: &str, clip
     Ok(())
 }
 
-/// Builds the TikTok Content Posting API `title` (post caption) field: the project/movie
-/// name followed by this clip's own hashtags plus the project's fetched trending hashtags
-/// (deduped, clip-specific ones first). Deliberately NOT the same text as `ai_caption` —
-/// that's already burned into the video frame by `render_clip_final`, so reusing it here
-/// made the posted caption redundant with the on-screen one. `hashtags_json`/`trending_json`
-/// are `clips.hashtags`/`projects.trending_hashtags`, JSON arrays of "#tag" strings that
-/// silently do nothing if unparseable (a clip/project predating either column, or containing
-/// malformed JSON, should still post — just without hashtags — rather than fail the upload).
-fn build_tiktok_title(project_name: &str, hashtags_json: &str, trending_json: &str) -> String {
+/// Dedupes a clip's own hashtags against its project's fetched trending hashtags
+/// (clip-specific ones first). `hashtags_json`/`trending_json` are `clips.hashtags` /
+/// `projects.trending_hashtags`, JSON arrays of "#tag" strings that silently do nothing if
+/// unparseable (a clip/project predating either column, or containing malformed JSON,
+/// should still work — just without hashtags — rather than fail). Shared by
+/// [`build_tiktok_title`] and the queue preview's display hashtags
+/// (`commands::queue::row_to_queue_item`) so both agree on the same tag list.
+pub(crate) fn dedupe_hashtags(hashtags_json: &str, trending_json: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut tags: Vec<String> = Vec::new();
     for json in [hashtags_json, trending_json] {
@@ -357,6 +395,15 @@ fn build_tiktok_title(project_name: &str, hashtags_json: &str, trending_json: &s
             }
         }
     }
+    tags
+}
+
+/// Builds the TikTok Content Posting API `title` (post caption) field: the project/movie
+/// name followed by this clip's deduped hashtags. Deliberately NOT the same text as
+/// `ai_caption` — that's already burned into the video frame by `render_clip_final`, so
+/// reusing it here made the posted caption redundant with the on-screen one.
+fn build_tiktok_title(project_name: &str, hashtags_json: &str, trending_json: &str) -> String {
+    let tags = dedupe_hashtags(hashtags_json, trending_json);
     if tags.is_empty() {
         project_name.to_string()
     } else {
@@ -404,6 +451,56 @@ fn set_progress(app: &AppHandle, id: &str, progress: i64) {
         "UPDATE upload_queue SET progress = ?1 WHERE id = ?2",
         params![progress, id],
     );
+}
+
+/// Extracts `(retry_after_seconds, human_message)` from an error tagged with
+/// `tiktok_api::RATE_LIMIT_PREFIX` ("RATE_LIMITED:<seconds>:<message>"), or `None` if the
+/// error isn't a rate-limit one.
+fn parse_rate_limit(message: &str) -> Option<(u64, String)> {
+    let rest = message.strip_prefix(tiktok_api::RATE_LIMIT_PREFIX)?;
+    let (secs_str, human) = rest.split_once(':')?;
+    let secs = secs_str.parse::<u64>().ok()?;
+    Some((secs, human.to_string()))
+}
+
+// Caps automatic rate-limit retries so a persistently misconfigured/over-quota app doesn't
+// requeue the same item forever — past this, it's surfaced as a real failure that needs a
+// person to look at (e.g. the TikTok app's daily post quota, not just a transient burst).
+const MAX_AUTO_RATE_LIMIT_RETRIES: i64 = 6;
+// Longest automatic backoff between retries, regardless of how far retry_count has climbed
+// or what TikTok's Retry-After asked for — keeps a single stuck item from silently sitting
+// for hours with no visible progress.
+const MAX_RATE_LIMIT_BACKOFF_SECONDS: u64 = 30 * 60;
+
+/// Reschedules a 429'd upload instead of dead-ending it as "failed" — TikTok's own
+/// `Retry-After` (or a 60s default) sets the base delay, doubled per previous retry
+/// (capped at `MAX_RATE_LIMIT_BACKOFF_SECONDS`) so a sustained rate limit backs off instead
+/// of retrying at the same cadence that caused it. Returns `false` (and marks the item
+/// genuinely failed) once `MAX_AUTO_RATE_LIMIT_RETRIES` is exhausted.
+fn schedule_rate_limit_retry(app: &AppHandle, id: &str, retry_after_seconds: u64, human_message: &str) -> bool {
+    let db = app.state::<Db>();
+    let Ok(conn) = db.0.lock() else { return false };
+    let retry_count: i64 = conn
+        .query_row("SELECT retry_count FROM upload_queue WHERE id = ?1", params![id], |row| row.get(0))
+        .unwrap_or(0);
+
+    if retry_count >= MAX_AUTO_RATE_LIMIT_RETRIES {
+        let _ = conn.execute(
+            "UPDATE upload_queue SET status = 'failed', error_message = ?1 WHERE id = ?2",
+            params![format!("TikTok kept rate-limiting this upload after {retry_count} automatic retries — {human_message}"), id],
+        );
+        return false;
+    }
+
+    let backoff = (retry_after_seconds.max(1) * 2u64.pow(retry_count.min(20) as u32)).min(MAX_RATE_LIMIT_BACKOFF_SECONDS);
+    let modifier = format!("+{backoff} seconds");
+    let note = format!("Rate-limited by TikTok — retrying automatically in ~{}s ({human_message})", backoff);
+    let _ = conn.execute(
+        "UPDATE upload_queue SET status = 'queued', retry_count = retry_count + 1, progress = 0,
+         error_message = ?1, scheduled_at = datetime('now', ?2) WHERE id = ?3",
+        params![note, modifier, id],
+    );
+    true
 }
 
 fn set_failed(app: &AppHandle, id: &str, error: &str) {

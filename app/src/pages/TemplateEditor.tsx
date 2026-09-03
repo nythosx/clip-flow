@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Stage, Layer, Image as KonvaImage, Text as KonvaText, Group, Rect } from "react-konva";
-import type Konva from "konva";
+import Konva from "konva";
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { ArrowLeft, Smartphone, Move, Image as ImageIcon, Type, SlidersHorizontal } from "lucide-react";
-import { useTemplateStore, Platform, CaptionOverlayConfig } from "../stores/templateStore";
+import { ArrowLeft, Smartphone, Move, Image as ImageIcon, Type, Subtitles, SlidersHorizontal } from "lucide-react";
+import { useTemplateStore, Platform, CaptionOverlayConfig, SubtitleOverlayConfig } from "../stores/templateStore";
 import { useSettingsStore, SETTING_DEFAULT_ENCODING } from "../stores/settingsStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useWatermarkStore } from "../stores/watermarkStore";
@@ -13,21 +13,44 @@ import { videoPreviewStyle } from "../lib/templatePreview";
 
 const DISPLAY_WIDTH = 340;
 
-type SectionId = "platform" | "transform" | "watermark" | "caption" | "encoding";
+type SectionId = "platform" | "transform" | "watermark" | "caption" | "subtitle" | "encoding";
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Smartphone }[] = [
   { id: "platform", label: "Output", icon: Smartphone },
   { id: "transform", label: "Transform", icon: Move },
   { id: "watermark", label: "Watermark", icon: ImageIcon },
   { id: "caption", label: "Caption", icon: Type },
+  { id: "subtitle", label: "Subtitles", icon: Subtitles },
   { id: "encoding", label: "Encoding", icon: SlidersHorizontal },
 ];
+
+// Sample line shown only in the editor so the subtitle box has something to measure/drag —
+// at render time each transcript cue's own text takes its place (see ffmpeg.rs's
+// subtitle_drawtext_filters).
+const SUBTITLE_PREVIEW_SAMPLE = "Synced lyric line appears here";
 
 function formatDurationShort(seconds: number): string {
   const total = Math.round(seconds);
   const m = Math.floor(total / 60);
   const s = total % 60;
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+// The caption background box previously used a fixed single-line height (fontSize +
+// padding*2), but KonvaText wraps to multiple lines once its content exceeds `width` — so
+// a long caption's text spilled below the box instead of the box growing to fit it. Konva's
+// own Text node already measures real wrapped-line height for these exact props, so reuse
+// it here instead of re-deriving an estimate.
+function measureCaptionBoxHeight(
+  text: string,
+  width: number,
+  fontSize: number,
+  fontStyle: string,
+  padding: number
+): number {
+  if (width <= 0 || fontSize <= 0) return fontSize + padding * 2;
+  const node = new Konva.Text({ text: text || " ", width, fontSize, fontStyle, padding, wrap: "word" });
+  return node.height();
 }
 
 function useHtmlImage(src: string | null): HTMLImageElement | null {
@@ -137,6 +160,94 @@ function CaptionFields({
           className="bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-xs"
           value={caption.alignment}
           onChange={(e) => onChange({ ...caption, alignment: e.target.value as "left" | "center" | "right" })}
+        >
+          <option value="left">Left</option>
+          <option value="center">Center</option>
+          <option value="right">Right</option>
+        </select>
+      </Field>
+    </>
+  );
+}
+
+// Same field set as CaptionFields minus the text box — subtitle text comes from the
+// project's transcript at render time (one cue at a time), not from anything typed here.
+// Drag the box in the canvas above to position it; these controls only cover its styling.
+function SubtitleFields({
+  subtitle,
+  onChange,
+}: {
+  subtitle: SubtitleOverlayConfig;
+  onChange: (next: SubtitleOverlayConfig) => void;
+}) {
+  return (
+    <>
+      <Field label="Enabled">
+        <input
+          type="checkbox"
+          checked={subtitle.enabled}
+          onChange={(e) => onChange({ ...subtitle, enabled: e.target.checked })}
+        />
+      </Field>
+      <p className="text-[11px] text-neutral-500 leading-snug">
+        Text is pulled from the project's transcript as the clip plays — drag the box in the
+        preview to position it, and use the fields below for styling.
+      </p>
+      <Field label="Font size">
+        <input
+          type="number"
+          className="w-16 bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-xs"
+          value={subtitle.fontSize}
+          onChange={(e) => onChange({ ...subtitle, fontSize: Number(e.target.value) })}
+        />
+      </Field>
+      <Field label="Font weight">
+        <select
+          className="bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-xs"
+          value={subtitle.fontWeight}
+          onChange={(e) => onChange({ ...subtitle, fontWeight: e.target.value as "normal" | "bold" })}
+        >
+          <option value="normal">Normal</option>
+          <option value="bold">Bold</option>
+        </select>
+      </Field>
+      <Field label="Font color">
+        <input
+          type="color"
+          value={subtitle.fontColor}
+          onChange={(e) => onChange({ ...subtitle, fontColor: e.target.value })}
+        />
+      </Field>
+      <Field label="Background color">
+        <input
+          type="color"
+          value={subtitle.backgroundColor}
+          onChange={(e) => onChange({ ...subtitle, backgroundColor: e.target.value })}
+        />
+      </Field>
+      <Field label="Background opacity">
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.05}
+          value={subtitle.backgroundOpacity}
+          onChange={(e) => onChange({ ...subtitle, backgroundOpacity: Number(e.target.value) })}
+        />
+      </Field>
+      <Field label="Max width (px)">
+        <input
+          type="number"
+          className="w-20 bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-xs"
+          value={subtitle.maxWidth}
+          onChange={(e) => onChange({ ...subtitle, maxWidth: Number(e.target.value) })}
+        />
+      </Field>
+      <Field label="Alignment">
+        <select
+          className="bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-xs"
+          value={subtitle.alignment}
+          onChange={(e) => onChange({ ...subtitle, alignment: e.target.value as "left" | "center" | "right" })}
         >
           <option value="left">Left</option>
           <option value="center">Center</option>
@@ -272,15 +383,54 @@ export default function TemplateEditor() {
   // dragged off-frame the way a full-width basis would allow once its own size is added on.
   const captionDisplayFontSize = canvasState.caption.fontSize * displayScale;
   const captionDisplayMaxWidth = canvasState.caption.maxWidth * displayScale;
-  const captionDisplayHeight = captionDisplayFontSize + canvasState.caption.padding * displayScale * 2;
+  const captionDisplayPadding = canvasState.caption.padding * displayScale;
+  const captionDisplayHeight = useMemo(
+    () =>
+      measureCaptionBoxHeight(
+        canvasState.caption.text,
+        captionDisplayMaxWidth,
+        captionDisplayFontSize,
+        canvasState.caption.fontWeight,
+        captionDisplayPadding
+      ),
+    [canvasState.caption.text, captionDisplayMaxWidth, captionDisplayFontSize, canvasState.caption.fontWeight, captionDisplayPadding]
+  );
   const captionX = canvasState.caption.position.x * Math.max(0, stageWidth - captionDisplayMaxWidth);
   const captionY = canvasState.caption.position.y * Math.max(0, stageHeight - captionDisplayHeight);
 
   const caption2DisplayFontSize = canvasState.caption2.fontSize * displayScale;
   const caption2DisplayMaxWidth = canvasState.caption2.maxWidth * displayScale;
-  const caption2DisplayHeight = caption2DisplayFontSize + canvasState.caption2.padding * displayScale * 2;
+  const caption2DisplayPadding = canvasState.caption2.padding * displayScale;
+  const caption2DisplayHeight = useMemo(
+    () =>
+      measureCaptionBoxHeight(
+        canvasState.caption2.text,
+        caption2DisplayMaxWidth,
+        caption2DisplayFontSize,
+        canvasState.caption2.fontWeight,
+        caption2DisplayPadding
+      ),
+    [canvasState.caption2.text, caption2DisplayMaxWidth, caption2DisplayFontSize, canvasState.caption2.fontWeight, caption2DisplayPadding]
+  );
   const caption2X = canvasState.caption2.position.x * Math.max(0, stageWidth - caption2DisplayMaxWidth);
   const caption2Y = canvasState.caption2.position.y * Math.max(0, stageHeight - caption2DisplayHeight);
+
+  const subtitleDisplayFontSize = canvasState.subtitle.fontSize * displayScale;
+  const subtitleDisplayMaxWidth = canvasState.subtitle.maxWidth * displayScale;
+  const subtitleDisplayPadding = canvasState.subtitle.padding * displayScale;
+  const subtitleDisplayHeight = useMemo(
+    () =>
+      measureCaptionBoxHeight(
+        SUBTITLE_PREVIEW_SAMPLE,
+        subtitleDisplayMaxWidth,
+        subtitleDisplayFontSize,
+        canvasState.subtitle.fontWeight,
+        subtitleDisplayPadding
+      ),
+    [subtitleDisplayMaxWidth, subtitleDisplayFontSize, canvasState.subtitle.fontWeight, subtitleDisplayPadding]
+  );
+  const subtitleX = canvasState.subtitle.position.x * Math.max(0, stageWidth - subtitleDisplayMaxWidth);
+  const subtitleY = canvasState.subtitle.position.y * Math.max(0, stageHeight - subtitleDisplayHeight);
 
   return (
     <div className="h-screen flex flex-col">
@@ -501,11 +651,52 @@ export default function TemplateEditor() {
                 </Group>
               </Layer>
             )}
+
+            {canvasState.subtitle.enabled && (
+              <Layer>
+                <Group
+                  x={subtitleX}
+                  y={subtitleY}
+                  draggable
+                  onDragEnd={(e) => {
+                    const maxX = Math.max(0, stageWidth - subtitleDisplayMaxWidth);
+                    const maxY = Math.max(0, stageHeight - subtitleDisplayHeight);
+                    const x = Math.min(maxX, Math.max(0, e.target.x()));
+                    const y = Math.min(maxY, Math.max(0, e.target.y()));
+                    updateCanvasState({
+                      subtitle: {
+                        ...canvasState.subtitle,
+                        position: {
+                          x: maxX > 0 ? x / maxX : 0,
+                          y: maxY > 0 ? y / maxY : 0,
+                        },
+                      },
+                    });
+                  }}
+                >
+                  <Rect
+                    width={subtitleDisplayMaxWidth}
+                    height={subtitleDisplayHeight}
+                    fill={canvasState.subtitle.backgroundColor}
+                    opacity={canvasState.subtitle.backgroundOpacity}
+                  />
+                  <KonvaText
+                    text={SUBTITLE_PREVIEW_SAMPLE}
+                    width={subtitleDisplayMaxWidth}
+                    padding={subtitleDisplayPadding}
+                    fontSize={subtitleDisplayFontSize}
+                    fontStyle={canvasState.subtitle.fontWeight}
+                    fill={canvasState.subtitle.fontColor}
+                    align={canvasState.subtitle.alignment}
+                  />
+                </Group>
+              </Layer>
+            )}
             </Stage>
           </div>
           <p className="text-xs text-neutral-500 mt-3 text-center max-w-xs">
-            Drag the watermark or caption to position them over the real clip. Pick a
-            different project/clip above to preview against other footage.
+            Drag the watermark, caption, or subtitle box to position them over the real clip.
+            Pick a different project/clip above to preview against other footage.
           </p>
         </div>
 
@@ -748,6 +939,16 @@ export default function TemplateEditor() {
                   placeholder="e.g. Part {part_number} — {part_number} is replaced with 1, 2, 3..."
                 />
               </div>
+            </>
+          )}
+
+          {activeSection === "subtitle" && (
+            <>
+              <h3 className="text-sm font-medium text-neutral-300 mb-1">Subtitles</h3>
+              <SubtitleFields
+                subtitle={canvasState.subtitle}
+                onChange={(subtitle) => updateCanvasState({ subtitle })}
+              />
             </>
           )}
 

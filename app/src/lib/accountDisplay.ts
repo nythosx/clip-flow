@@ -12,6 +12,16 @@ export const PLATFORM_BADGE_CLASSES: Record<string, string> = {
   facebook: "bg-blue-700/90 text-white",
 };
 
+const PLATFORM_FALLBACK_URL: Record<string, string> = {
+  tiktok: "https://www.tiktok.com/",
+  youtube: "https://studio.youtube.com/",
+  facebook: "https://www.facebook.com/",
+};
+
+export function launchUrlFor(account: Account, creds: AccountCredentials): string {
+  return creds.profileDeepLink || PLATFORM_FALLBACK_URL[account.platform] || "https://www.google.com/";
+}
+
 export interface AccountCredentials {
   avatarUrl?: string;
   bioDescription?: string;

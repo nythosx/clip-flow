@@ -95,6 +95,29 @@ fn client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
+/// `queue_manager::run_tiktok_job`'s error string is checked for this prefix so a 429 gets
+/// automatically rescheduled with backoff instead of dead-ending as a "failed" upload the
+/// user has to notice and retry by hand — see `rate_limit_error` below and
+/// `queue_manager::RATE_LIMIT_PREFIX`'s doc comment for the wire format.
+pub const RATE_LIMIT_PREFIX: &str = "RATE_LIMITED:";
+
+/// Builds a `RATE_LIMIT_PREFIX`-tagged error for a 429 response: `RATE_LIMITED:<retry-after
+/// seconds>:<human message>`. Honors TikTok's `Retry-After` header when present (seconds or
+/// an HTTP-date — only the seconds form is parsed; an HTTP-date falls back to the default)
+/// so the backoff matches what TikTok itself is asking for instead of guessing. Consumes
+/// `resp` to read its body for the message.
+async fn rate_limit_error(resp: reqwest::Response, context: &str) -> String {
+    const DEFAULT_RETRY_SECONDS: u64 = 60;
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RETRY_SECONDS);
+    let body = resp.text().await.unwrap_or_default();
+    format!("{RATE_LIMIT_PREFIX}{retry_after}:{context} rate-limited (429 Too Many Requests): {body}")
+}
+
 async fn parse_token_response(resp: reqwest::Response) -> Result<TokenResponse, String> {
     let status = resp.status();
     let body = resp.text().await.map_err(|e| e.to_string())?;
@@ -315,6 +338,9 @@ pub async fn init_video_publish(
         .await
         .map_err(|e| e.to_string())?;
     let status = resp.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(rate_limit_error(resp, "TikTok publish init").await);
+    }
     let body = resp.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
         return Err(format!("TikTok publish init failed ({status}): {body}"));
@@ -351,6 +377,9 @@ pub async fn upload_video(upload_url: &str, video_path: &Path, video_size: u64, 
             .await
             .map_err(|e| e.to_string())?;
         let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(rate_limit_error(resp, "TikTok video upload").await);
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("TikTok video upload failed ({status}): {body}"));
@@ -387,6 +416,9 @@ pub async fn fetch_publish_status(access_token: &str, publish_id: &str) -> Resul
         .await
         .map_err(|e| e.to_string())?;
     let status = resp.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(rate_limit_error(resp, "TikTok publish status fetch").await);
+    }
     let body = resp.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
         return Err(format!("TikTok publish status fetch failed ({status}): {body}"));

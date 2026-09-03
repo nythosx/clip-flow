@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAccountStore, AccountPlatform } from "../stores/accountStore";
 import { useOnlineStore } from "../stores/onlineStore";
-import { PLATFORM_LABELS, PLATFORM_BADGE_CLASSES, parseCredentials, formatCount } from "../lib/accountDisplay";
+import { invoke } from "@tauri-apps/api/core";
+import { PLATFORM_LABELS, PLATFORM_BADGE_CLASSES, parseCredentials, formatCount, launchUrlFor } from "../lib/accountDisplay";
 
 function AddAccountDialog({
   onClose,
@@ -343,6 +344,19 @@ export default function Accounts() {
                   </div>
 
                   <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      className="text-xs text-neutral-400 hover:text-neutral-200 px-2 py-1"
+                      onClick={() =>
+                        invoke("open_platform_browser", {
+                          label: `acct-browser-${a.id}`,
+                          url: launchUrlFor(a, creds),
+                          title: `${a.accountName} — ${PLATFORM_LABELS[a.platform] ?? a.platform}`,
+                        })
+                      }
+                      title="Open this platform in its own in-app browser window — sign in once and it stays signed in for next time"
+                    >
+                      Launch
+                    </button>
                     {a.platform === "tiktok" && (
                       <button
                         className="text-xs text-neutral-400 hover:text-neutral-200 px-2 py-1 disabled:opacity-50"

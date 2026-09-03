@@ -8,6 +8,7 @@ import Accounts from "./pages/Accounts";
 import AccountDetail from "./pages/AccountDetail";
 import Queue from "./pages/Queue";
 import Settings from "./pages/Settings";
+import Legal from "./pages/Legal";
 import YouTubeImport from "./pages/YouTubeImport";
 
 export default function App() {
@@ -23,6 +24,7 @@ export default function App() {
         <Route path="/youtube" element={<YouTubeImport />} />
         <Route path="/queue" element={<Queue />} />
         <Route path="/settings" element={<Settings />} />
+        <Route path="/legal" element={<Legal />} />
       </Route>
     </Routes>
   );

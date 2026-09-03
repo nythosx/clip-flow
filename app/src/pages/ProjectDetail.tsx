@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { ListPlus, Film, Plus, UploadCloud, Zap, Pencil, RefreshCw, Eye, Trash2, X, Loader2 } from "lucide-react";
-import { useProjectStore, Clip, Project } from "../stores/projectStore";
+import { ListPlus, Film, Plus, UploadCloud, Zap, Pencil, RefreshCw, Eye, Trash2, X, Loader2, AlertTriangle, Clock } from "lucide-react";
+import { useProjectStore, Clip, Project, TranscriptSyncStatus } from "../stores/projectStore";
 import { useTemplateStore, TemplateConfig, CaptionOverlayConfig, defaultTemplateConfig } from "../stores/templateStore";
 import { useSettingsStore, SETTING_DEFAULT_TEMPLATE_ID } from "../stores/settingsStore";
 import { useAccountStore, Account } from "../stores/accountStore";
@@ -15,6 +15,26 @@ import NewProjectDialog from "../components/NewProjectDialog";
 import AutoUploadSettingsDialog from "../components/AutoUploadSettingsDialog";
 
 const PLATFORM_LABELS: Record<string, string> = { tiktok: "TikTok", youtube: "YouTube" };
+
+const STAGE_LABELS: Record<string, string> = {
+  starting: "Starting",
+  parsing_transcript: "Parsing transcript",
+  smart_trimmer: "Smart Trimmer (removing intro/credits)",
+  clip_finder: "Clip Finder (picking best moments)",
+  movie_segmenter: "Movie Segmenter (splitting into parts)",
+  saving: "Saving",
+  captions: "Generating captions",
+  done: "Done",
+  ai_status: "AI Engine",
+};
+
+function stageLabel(stage: string): string {
+  return STAGE_LABELS[stage] ?? stage;
+}
+
+function formatClockTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
 
 function formatDuration(seconds: number): string {
   const total = Math.round(seconds);
@@ -85,14 +105,52 @@ function CaptionOverlayBlock({
   );
 }
 
+// Subtitle has the same box/position/style fields as a caption but no fixed `text` — the
+// line currently on screen is passed in from the parent's video-time-driven cue lookup.
+function SubtitleOverlayBlock({
+  subtitle,
+  outputWidth,
+  text,
+}: {
+  subtitle: TemplateConfig["subtitle"];
+  outputWidth: number;
+  text: string;
+}) {
+  if (!subtitle.enabled || !text) return null;
+  const bg = hexToRgba(subtitle.backgroundColor, subtitle.backgroundOpacity);
+
+  return (
+    <div
+      className="absolute pointer-events-none whitespace-pre-wrap"
+      style={{
+        left: `${subtitle.position.x * 100}%`,
+        top: `${subtitle.position.y * 100}%`,
+        transform: `translate(-${subtitle.position.x * 100}%, -${subtitle.position.y * 100}%)`,
+        fontFamily: subtitle.fontFamily,
+        fontWeight: subtitle.fontWeight,
+        fontSize: `${(subtitle.fontSize / outputWidth) * 100}cqw`,
+        color: subtitle.fontColor,
+        background: bg,
+        padding: `${(subtitle.padding / outputWidth) * 100}cqw`,
+        textAlign: subtitle.alignment,
+        maxWidth: `${(subtitle.maxWidth / outputWidth) * 100}%`,
+      }}
+    >
+      {text}
+    </div>
+  );
+}
+
 function TemplatePreviewOverlay({
   config,
   clip,
   partNumber,
+  subtitleText = "",
 }: {
   config: TemplateConfig;
   clip: Clip;
   partNumber?: number;
+  subtitleText?: string;
 }) {
   return (
     <>
@@ -122,6 +180,7 @@ function TemplatePreviewOverlay({
         aiCaption={clip.aiCaption}
         partNumber={partNumber}
       />
+      <SubtitleOverlayBlock subtitle={config.subtitle} outputWidth={config.output.width} text={subtitleText} />
     </>
   );
 }
@@ -490,6 +549,12 @@ function QueueViewerDialog({ items, onClose }: { items: QueueItem[]; onClose: ()
               autoPlay
               className="w-full max-h-[420px] rounded bg-black"
             />
+            <div className="mt-3">
+              <p className="text-sm font-medium text-neutral-100 truncate">{previewItem.title}</p>
+              {previewItem.hashtags.length > 0 && (
+                <p className="text-xs text-blue-400 mt-1 break-words">{previewItem.hashtags.join(" ")}</p>
+              )}
+            </div>
             <button
               className="text-xs text-neutral-400 hover:text-neutral-200 mt-2"
               onClick={() => setPreviewItem(null)}
@@ -506,20 +571,21 @@ function QueueViewerDialog({ items, onClose }: { items: QueueItem[]; onClose: ()
               return (
                 <div
                   key={item.id}
-                  className="flex items-center gap-3 rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2.5"
+                  className={`flex items-center gap-3 rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2.5 ${
+                    thumbPath ? "cursor-pointer hover:border-neutral-700" : ""
+                  }`}
+                  onClick={() => thumbPath && setPreviewItem(item)}
                 >
-                  <button
-                    className="w-16 h-10 rounded bg-neutral-800 overflow-hidden flex-shrink-0 flex items-center justify-center disabled:cursor-not-allowed"
-                    disabled={!thumbPath}
+                  <div
+                    className="w-16 h-10 rounded bg-neutral-800 overflow-hidden flex-shrink-0 flex items-center justify-center"
                     title={thumbPath ? "Play" : "No preview"}
-                    onClick={() => thumbPath && setPreviewItem(item)}
                   >
                     {thumbPath ? (
                       <video src={convertFileSrc(thumbPath)} className="w-full h-full object-cover pointer-events-none" />
                     ) : (
                       <span className="text-[10px] text-neutral-600">No preview</span>
                     )}
-                  </button>
+                  </div>
 
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 text-sm">
@@ -538,7 +604,7 @@ function QueueViewerDialog({ items, onClose }: { items: QueueItem[]; onClose: ()
                     {item.errorMessage && <p className="text-xs text-red-400 mt-1 truncate">{item.errorMessage}</p>}
                   </div>
 
-                  <div className="flex items-center gap-1 flex-shrink-0">
+                  <div className="flex items-center gap-1 flex-shrink-0" onClick={(e) => e.stopPropagation()}>
                     {item.status === "failed" && (
                       <button
                         className="p-1.5 rounded hover:bg-neutral-800 text-neutral-400"
@@ -672,8 +738,6 @@ function AutoUploadDialog({
   const [selectedAccountIds, setSelectedAccountIds] = useState<Set<string>>(
     () => new Set(accounts.filter((a) => a.isActive).map((a) => a.id))
   );
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   // A second click, not a second modal — this queues real uploads that start immediately
   // (queue_manager.rs's kick() picks them up right away), so the first click on "Queue N
   // items" just swaps that button for an explicit confirmation instead of firing right away.
@@ -695,31 +759,37 @@ function AutoUploadDialog({
     });
   }
 
-  async function submit() {
-    setSubmitting(true);
-    setError(null);
-    try {
-      for (const clipId of selectedClipIds) {
-        // Template is applied here, at queue time, not while browsing — so switching
-        // templates while looking at clips never kicks off a render. Always re-renders
-        // (no "already has a final render for this template id" shortcut) because the
-        // template's own config (alignment, text, colors, ...) can change without its id
-        // changing — reusing an old render by id alone would silently serve stale output.
-        if (selectedTemplateId) {
-          await renderClipFinal(clipId, selectedTemplateId);
-        }
-        const already = alreadyQueued.get(clipId) ?? new Set<string>();
-        const accountIds = [...selectedAccountIds].filter((accId) => !already.has(accId));
-        if (accountIds.length > 0) {
-          await addToQueue(clipId, accountIds);
+  function submit() {
+    const clipIds = [...selectedClipIds];
+    const accountIds = [...selectedAccountIds];
+    // Fire-and-forget: rendering + queueing runs in the background (the render queue
+    // already serializes/tracks itself via render_manager.rs, and queue items show up in
+    // the Queue page immediately after each addToQueue) — the modal doesn't need to stay
+    // open and block the user until every clip in the batch is done. Per-clip failures are
+    // surfaced where the user will actually look afterward (the render queue indicator /
+    // the queue item's own error state), not in this now-closed modal.
+    (async () => {
+      for (const clipId of clipIds) {
+        try {
+          // Template is applied here, at queue time, not while browsing — so switching
+          // templates while looking at clips never kicks off a render. Always re-renders
+          // (no "already has a final render for this template id" shortcut) because the
+          // template's own config (alignment, text, colors, ...) can change without its id
+          // changing — reusing an old render by id alone would silently serve stale output.
+          if (selectedTemplateId) {
+            await renderClipFinal(clipId, selectedTemplateId);
+          }
+          const already = alreadyQueued.get(clipId) ?? new Set<string>();
+          const toQueue = accountIds.filter((accId) => !already.has(accId));
+          if (toQueue.length > 0) {
+            await addToQueue(clipId, toQueue);
+          }
+        } catch (e) {
+          console.error(`Queue uploads: failed for clip ${clipId}:`, e);
         }
       }
-      onClose();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSubmitting(false);
-    }
+    })();
+    onClose();
   }
 
   const label = (c: Clip) => {
@@ -809,8 +879,6 @@ function AutoUploadDialog({
           </>
         )}
 
-        {error && <p className="text-sm text-red-400 mt-3">{error}</p>}
-
         {confirming && (
           <p className="text-xs text-amber-400 pt-3">
             This queues {selectedClipIds.size} clip{selectedClipIds.size === 1 ? "" : "s"} to{" "}
@@ -828,16 +896,133 @@ function AutoUploadDialog({
           </button>
           <button
             className="px-4 py-2 rounded bg-blue-600 hover:bg-blue-500 text-sm disabled:opacity-50"
-            disabled={submitting || selectedClipIds.size === 0 || selectedAccountIds.size === 0}
+            disabled={selectedClipIds.size === 0 || selectedAccountIds.size === 0}
             onClick={() => (confirming ? submit() : setConfirming(true))}
           >
-            {submitting
-              ? "Queuing…"
-              : confirming
-                ? "Confirm & queue"
-                : `Queue ${selectedClipIds.size} item${selectedClipIds.size === 1 ? "" : "s"}`}
+            {confirming
+              ? "Confirm & queue"
+              : `Queue ${selectedClipIds.size} item${selectedClipIds.size === 1 ? "" : "s"}`}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// Automatic mismatch warning + manual re-sync control — see
+// commands::project::get_transcript_sync_status/set_transcript_offset. There's no forced
+// audio-alignment "matcher" here (that needs real speech-to-timing analysis, e.g. Whisper's
+// word timestamps, which this app doesn't run) — this is a constant-offset correction: type
+// how many seconds the transcript is early/late and every subtitle cue shifts by that much,
+// both in this live preview and in the final render.
+function TranscriptSyncWarning({
+  status,
+  expanded,
+  onToggle,
+  onApply,
+}: {
+  status: TranscriptSyncStatus;
+  expanded: boolean;
+  onToggle: () => void;
+  onApply: (offsetSeconds: number) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState(String(status.offsetSeconds));
+  const [applying, setApplying] = useState(false);
+  const suggested = status.offsetSeconds - status.transcriptStartSeconds;
+
+  return (
+    <div className="border-b border-amber-900 bg-amber-950/40">
+      <button
+        className="w-full flex items-center gap-2 px-4 py-1.5 text-xs text-amber-300 text-left"
+        onClick={onToggle}
+      >
+        <AlertTriangle size={13} className="shrink-0" />
+        <span className="flex-1">
+          Transcript timing looks off — it runs {formatDuration(status.transcriptEndSeconds)} but the movie is{" "}
+          {formatDuration(status.movieDurationSeconds)} long. Subtitles may not line up with what's on screen.
+        </span>
+        <span className="text-amber-500 underline">{expanded ? "Hide" : "Fix sync"}</span>
+      </button>
+      {expanded && (
+        <div className="px-4 pb-3 flex items-center gap-2 text-xs text-amber-200">
+          <span>Shift transcript by</span>
+          <input
+            type="number"
+            step="0.5"
+            className="w-24 px-2 py-1 rounded bg-neutral-900 border border-amber-800 text-neutral-100"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+          />
+          <span>seconds (negative = earlier)</span>
+          <button
+            className="px-3 py-1 rounded bg-amber-700 hover:bg-amber-600 text-neutral-100 disabled:opacity-50"
+            disabled={applying || !Number.isFinite(Number(draft))}
+            onClick={async () => {
+              setApplying(true);
+              try {
+                await onApply(Number(draft));
+              } finally {
+                setApplying(false);
+              }
+            }}
+          >
+            {applying ? "Applying…" : "Apply"}
+          </button>
+          <button
+            className="text-amber-500 hover:text-amber-400 underline"
+            onClick={() => setDraft(suggested.toFixed(1))}
+            title="Shift the transcript's first line to start at 0:00 — a common fix when it starts partway into the movie"
+          >
+            Suggest ({suggested >= 0 ? "+" : ""}
+            {suggested.toFixed(1)}s)
+          </button>
+          <span className="text-amber-500">
+            This only re-times the subtitle overlay — it won't re-cut clips or re-run AI analysis.
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ActivityLogPanel({
+  entries,
+  onClose,
+}: {
+  entries: import("../stores/projectStore").ActivityLogEntry[];
+  onClose: () => void;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [entries.length]);
+
+  return (
+    <div className="fixed right-0 top-14 bottom-0 w-[380px] bg-[#161618] border-l border-black/40 z-40 flex flex-col shadow-2xl">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-black/40">
+        <h2 className="text-sm font-medium">Activity log</h2>
+        <button className="p-1 rounded hover:bg-neutral-800 text-neutral-400" onClick={onClose}>
+          <X size={16} />
+        </button>
+      </div>
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
+        {entries.length === 0 ? (
+          <p className="text-xs text-neutral-500">Nothing yet — run Analyze to see a live timeline here.</p>
+        ) : (
+          entries.map((entry) => (
+            <div key={entry.id} className={entry.stage === "ai_status" ? "pl-3 border-l-2 border-neutral-800" : "pl-3 border-l-2 border-blue-600"}>
+              <div className="flex items-center gap-2 text-[10px] text-neutral-500">
+                <span className="font-mono">{formatClockTime(entry.timestamp)}</span>
+                <span className="uppercase">{entry.mode}</span>
+                {entry.progress >= 0 && <span>{Math.round(entry.progress * 100)}%</span>}
+              </div>
+              <p className={entry.stage === "ai_status" ? "text-xs text-neutral-400" : "text-xs text-neutral-200 font-medium"}>
+                {entry.stage === "ai_status" ? entry.detail : stageLabel(entry.stage)}
+              </p>
+            </div>
+          ))
+        )}
       </div>
     </div>
   );
@@ -875,6 +1060,10 @@ export default function ProjectDetail() {
     trendingHashtags,
     fetchingTrendingHashtags,
     fetchTrendingHashtags,
+    getTranscriptSyncStatus,
+    setTranscriptOffset,
+    activityLog,
+    initActivityLogListener,
   } = useProjectStore();
   const isOnline = useOnlineStore((s) => s.isOnline);
   const OFFLINE_TITLE = "No internet connection — this needs to reach the AI Engine/platform.";
@@ -892,6 +1081,14 @@ export default function ProjectDetail() {
   const [queuedClipId, setQueuedClipId] = useState<string | null>(null);
   const [queueing, setQueueing] = useState(false);
   const [videoNaturalSize, setVideoNaturalSize] = useState<{ width: number; height: number } | null>(null);
+  // Subtitle cues (clip-relative start/end/text) for the currently selected clip — mirrors
+  // exactly what render_final burns into the video via ffmpeg's drawtext `enable` windows
+  // (see transcript::compute_cues), so the raw-trim live preview shows the same lines at the
+  // same instants instead of the subtitle only ever appearing once a clip is uploaded.
+  const [subtitleCues, setSubtitleCues] = useState<{ start: number; end: number; text: string }[]>([]);
+  const [previewTime, setPreviewTime] = useState(0);
+  const [syncStatus, setSyncStatus] = useState<TranscriptSyncStatus | null>(null);
+  const [showSyncFixer, setShowSyncFixer] = useState(false);
   // Which analysis progress bar (clipsAnalysisProgress vs movieAnalysisProgress) is visible
   // is keyed off this — it used to always default to "clips" regardless of which mode a
   // project actually used, so a Full Video project's caption-backfill progress (still
@@ -902,6 +1099,7 @@ export default function ProjectDetail() {
   const [displayMode, setDisplayMode] = useState<"clips" | "movie">("clips");
   const [showAutoUpload, setShowAutoUpload] = useState(false);
   const [showQueueViewer, setShowQueueViewer] = useState(false);
+  const [showActivityLog, setShowActivityLog] = useState(false);
   const [showAutoUploadSettings, setShowAutoUploadSettings] = useState(false);
   const [showAutoUploadConfirm, setShowAutoUploadConfirm] = useState(false);
   const [autoUploadError, setAutoUploadError] = useState<string | null>(null);
@@ -926,6 +1124,10 @@ export default function ProjectDetail() {
   // video tag would immediately error again on the same still-broken file, re-arming the
   // retry effect in an infinite loop that looked like rapid blinking.
   const autoRetryAttempts = useRef<Record<string, number>>({});
+
+  useEffect(() => {
+    initActivityLogListener();
+  }, [initActivityLogListener]);
 
   useEffect(() => {
     if (!id) return;
@@ -957,6 +1159,30 @@ export default function ProjectDetail() {
     if (currentProject.partsCount > 0 && currentProject.clipsCount === 0) setDisplayMode("movie");
     else if (currentProject.clipsCount > 0 && currentProject.partsCount === 0) setDisplayMode("clips");
   }, [currentProject?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Warns automatically when a transcript's own timestamps don't line up with how long the
+  // movie file actually is (wrong export, transcript for a different cut of the movie,
+  // etc.) — probes the real file duration via ffmpeg rather than trusting anything derived
+  // from the transcript itself. Re-checks whenever the project (or its saved offset fix)
+  // changes.
+  useEffect(() => {
+    setSyncStatus(null);
+    if (!currentProject?.transcriptPath) return;
+    let cancelled = false;
+    getTranscriptSyncStatus(currentProject.id)
+      .then((status) => {
+        if (!cancelled) setSyncStatus(status);
+      })
+      .catch((e) => {
+        // Best-effort background check (e.g. ffmpeg not on PATH would fail this the same
+        // way it fails everything else render-related, already surfaced elsewhere) — not
+        // worth its own error banner.
+        console.warn("Transcript sync check failed:", e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentProject?.id, currentProject?.transcriptPath, currentProject?.transcriptOffsetSeconds]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Whichever mode currently has a live analysis (including the post-slicing caption
   // backfill, which can run long after "parts"/"clips" first appear) should always be
@@ -1014,9 +1240,10 @@ export default function ProjectDetail() {
     if (!template) return null;
     try {
       const parsed = JSON.parse(template.configJson) as Partial<TemplateConfig>;
-      // Templates saved before caption2 was added have no caption2 field at all — merge
-      // onto the defaults so older templates don't crash the caption overlay render.
-      return { ...defaultTemplateConfig(parsed.platform ?? "tiktok"), ...parsed, caption2: parsed.caption2 ?? defaultTemplateConfig().caption2 };
+      // Templates saved before caption2/subtitle were added have no such field at all —
+      // merge onto the defaults so older templates don't crash the caption overlay render.
+      const defaults = defaultTemplateConfig(parsed.platform ?? "tiktok");
+      return { ...defaults, ...parsed, caption2: parsed.caption2 ?? defaults.caption2, subtitle: parsed.subtitle ?? defaults.subtitle };
     } catch {
       return null;
     }
@@ -1029,6 +1256,30 @@ export default function ProjectDetail() {
   useEffect(() => {
     setCustomCaptionDraft(selectedClip?.customCaption ?? "");
   }, [selectedClip?.id, selectedClip?.customCaption]);
+
+  useEffect(() => {
+    setPreviewTime(0);
+    if (!selectedClip) {
+      setSubtitleCues([]);
+      return;
+    }
+    let cancelled = false;
+    invoke<{ start: number; end: number; text: string }[]>("get_clip_subtitle_cues", { clipId: selectedClip.id })
+      .then((cues) => {
+        if (!cancelled) setSubtitleCues(cues);
+      })
+      .catch(() => {
+        if (!cancelled) setSubtitleCues([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedClip?.id]);
+
+  const activeSubtitleText = useMemo(() => {
+    const cue = subtitleCues.find((c) => previewTime >= c.start && previewTime < c.end);
+    return cue?.text ?? "";
+  }, [subtitleCues, previewTime]);
 
   useEffect(() => {
     setPartCaptionDraft(selectedTemplateConfig?.caption2.text ?? "");
@@ -1107,6 +1358,11 @@ export default function ProjectDetail() {
     });
   }, [selectedClip, failedPlaybackClipIds, renderingClipIds, renderClipFinal, renderClipPreview, selectedTemplateId]);
 
+  const projectActivityLog = useMemo(
+    () => activityLog.filter((e) => e.projectId === id),
+    [activityLog, id]
+  );
+
   if (!currentProject) {
     return (
       <div className="p-8">
@@ -1156,11 +1412,32 @@ export default function ProjectDetail() {
           >
             <Eye size={14} /> View queue
           </button>
+          <button
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium ${
+              showActivityLog ? "bg-blue-600 hover:bg-blue-500" : "bg-neutral-800 hover:bg-neutral-700"
+            }`}
+            onClick={() => setShowActivityLog((v) => !v)}
+            title="Toggle the activity log — a detailed timeline of what Analyze is doing"
+          >
+            <Clock size={14} /> Activity
+          </button>
         </div>
       </div>
 
       {error && (
         <div className="px-4 py-1.5 bg-red-950/50 border-b border-red-900 text-xs text-red-300">{error}</div>
+      )}
+
+      {syncStatus?.mismatch && currentProject && (
+        <TranscriptSyncWarning
+          status={syncStatus}
+          expanded={showSyncFixer}
+          onToggle={() => setShowSyncFixer((v) => !v)}
+          onApply={async (offset) => {
+            await setTranscriptOffset(currentProject.id, offset);
+            setShowSyncFixer(false);
+          }}
+        />
       )}
 
       <div className="flex-1 flex min-h-0">
@@ -1242,11 +1519,13 @@ export default function ProjectDetail() {
                   onError={() =>
                     setFailedPlaybackClipIds((prev) => new Set(prev).add(selectedClip.id))
                   }
+                  onTimeUpdate={(e) => setPreviewTime(e.currentTarget.currentTime)}
                 />
                 <TemplatePreviewOverlay
                   config={selectedTemplateConfig}
                   clip={selectedClip}
                   partNumber={selectedPartNumber}
+                  subtitleText={activeSubtitleText}
                 />
               </div>
             ) : (
@@ -1615,7 +1894,7 @@ export default function ProjectDetail() {
               <div className="flex items-center gap-3">
                 <p className="text-xs text-neutral-500 animate-pulse">
                   Analyzing {ANALYZE_MODE_LABELS[displayMode]}…{" "}
-                  {Math.round((activeAnalysisProgress?.progress ?? 0) * 100)}% ({activeAnalysisProgress?.stage})
+                  {Math.round((activeAnalysisProgress?.progress ?? 0) * 100)}% ({stageLabel(activeAnalysisProgress?.stage ?? "")})
                 </p>
                 <button
                   className="px-3 py-1 rounded bg-red-900/40 hover:bg-red-900/60 text-red-300 text-xs font-medium"
@@ -1687,6 +1966,8 @@ export default function ProjectDetail() {
           onClose={() => setShowQueueViewer(false)}
         />
       )}
+
+      {showActivityLog && <ActivityLogPanel entries={projectActivityLog} onClose={() => setShowActivityLog(false)} />}
 
       {showAutoUploadSettings && <AutoUploadSettingsDialog onClose={() => setShowAutoUploadSettings(false)} />}
 

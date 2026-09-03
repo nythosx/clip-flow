@@ -23,6 +23,12 @@ pub struct QueueItem {
     pub scheduled_at: Option<String>,
     pub completed_at: Option<String>,
     pub created_at: String,
+    // The project/movie name — same "title" text queue_manager::build_tiktok_title posts as
+    // the caption's first line — surfaced here so the queue preview can show what's about to
+    // go out, not just the rendered video.
+    pub title: String,
+    // Deduped clip + trending hashtags, same list build_tiktok_title posts alongside title.
+    pub hashtags: Vec<String>,
 }
 
 const SELECT_QUEUE_ITEM: &str = "
@@ -30,13 +36,17 @@ const SELECT_QUEUE_ITEM: &str = "
         q.id, q.clip_id, q.account_id, a.account_name, a.platform,
         q.status, q.progress, q.retry_count, q.error_message, q.platform_post_id,
         c.output_path AS clip_output_path, c.final_output_path AS clip_final_output_path,
-        q.scheduled_at, q.completed_at, q.created_at
+        q.scheduled_at, q.completed_at, q.created_at,
+        p.name AS project_name, c.hashtags AS clip_hashtags, p.trending_hashtags AS trending_hashtags
     FROM upload_queue q
     JOIN accounts a ON a.id = q.account_id
     JOIN clips c ON c.id = q.clip_id
+    JOIN projects p ON p.id = c.project_id
 ";
 
 fn row_to_queue_item(row: &rusqlite::Row) -> rusqlite::Result<QueueItem> {
+    let clip_hashtags: String = row.get("clip_hashtags")?;
+    let trending_hashtags: String = row.get("trending_hashtags")?;
     Ok(QueueItem {
         id: row.get("id")?,
         clip_id: row.get("clip_id")?,
@@ -53,6 +63,8 @@ fn row_to_queue_item(row: &rusqlite::Row) -> rusqlite::Result<QueueItem> {
         scheduled_at: row.get("scheduled_at")?,
         completed_at: row.get("completed_at")?,
         created_at: row.get("created_at")?,
+        title: row.get("project_name")?,
+        hashtags: crate::queue_manager::dedupe_hashtags(&clip_hashtags, &trending_hashtags),
     })
 }
 

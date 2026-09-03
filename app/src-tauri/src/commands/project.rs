@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Tracks the currently in-flight AI requestId for each `"{project_id}:{mode}"` pair so
 /// `cancel_analysis` can find and interrupt it. Entries only exist while an AI call for
@@ -42,6 +42,7 @@ impl CaptionLocks {
 /// (success, failure, or — if cancelled — the "Cancelled by user" error `AiClient::cancel_request`
 /// injects).
 async fn call_ai_tracked(
+    app: &AppHandle,
     ai: &Arc<AiClient>,
     registry: &AnalysisRegistry,
     key: &str,
@@ -49,8 +50,21 @@ async fn call_ai_tracked(
 ) -> Result<Value, String> {
     let request_id = uuid::Uuid::new_v4().to_string();
     payload["requestId"] = json!(request_id);
-    registry.0.lock().map_err(|e| e.to_string())?.insert(key.to_string(), request_id);
+    registry.0.lock().map_err(|e| e.to_string())?.insert(key.to_string(), request_id.clone());
+
+    let mut status_rx = ai.subscribe_status(&request_id).await;
+    let (project_id, mode) = key.split_once(':').unwrap_or((key, ""));
+    let app_for_status = app.clone();
+    let project_id_owned = project_id.to_string();
+    let mode_owned = mode.to_string();
+    let status_task = tauri::async_runtime::spawn(async move {
+        while let Some(message) = status_rx.recv().await {
+            emit_detail(&app_for_status, &project_id_owned, &mode_owned, &message);
+        }
+    });
+
     let result = ai.call_ai_default_timeout(payload).await;
+    status_task.abort();
     registry.0.lock().map_err(|e| e.to_string())?.remove(key);
     result
 }
@@ -75,6 +89,7 @@ pub struct Project {
     pub clips_count: i64,
     pub parts_count: i64,
     pub trending_hashtags: Vec<String>,
+    pub transcript_offset_seconds: f64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -114,6 +129,7 @@ pub struct ProjectAnalysisProgress {
     pub mode: String, // "clips" | "movie"
     pub stage: String,
     pub progress: f64,
+    pub detail: Option<String>,
 }
 
 fn row_to_project(row: &rusqlite::Row) -> rusqlite::Result<Project> {
@@ -136,6 +152,7 @@ fn row_to_project(row: &rusqlite::Row) -> rusqlite::Result<Project> {
         clips_count: row.get("clips_count")?,
         parts_count: row.get("parts_count")?,
         trending_hashtags: serde_json::from_str(&trending_hashtags_json).unwrap_or_default(),
+        transcript_offset_seconds: row.get("transcript_offset_seconds")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -256,11 +273,136 @@ pub async fn update_project_name(db: State<'_, Db>, id: String, name: String) ->
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptSyncStatus {
+    pub movie_duration_seconds: f64,
+    // Transcript's own [first entry start, last entry end] span, BEFORE the stored offset
+    // is applied — this is what a mismatch check compares against the real movie duration.
+    pub transcript_start_seconds: f64,
+    pub transcript_end_seconds: f64,
+    pub offset_seconds: f64,
+    // True when the transcript's span is off from the movie's real duration by more than
+    // the tolerance below, OR it starts more than the tolerance into the movie — either
+    // shape is a strong sign the transcript wasn't exported from this exact video file.
+    pub mismatch: bool,
+}
+
+// How far off (in seconds) a transcript's span/start can be from the movie's real duration
+// before it's flagged — generous enough to tolerate a transcript that simply omits trailing
+// credits or a leading logo card, but still catches "wrong file" / "way out of sync" cases.
+const SYNC_TOLERANCE_SECONDS: f64 = 45.0;
+
+/// Compares a project's transcript timestamps against its movie file's actual duration
+/// (probed fresh via ffmpeg, not the `source_duration_seconds` column — that field is
+/// derived FROM the transcript itself during Analyze, so it can't catch the transcript
+/// being wrong in the first place). Surfaces a warning banner in the project view instead
+/// of the mismatch only becoming visible once you notice captions drifting from the audio.
 #[tauri::command]
-pub async fn delete_project(db: State<'_, Db>, id: String) -> Result<(), String> {
+pub async fn get_transcript_sync_status(db: State<'_, Db>, project_id: String) -> Result<TranscriptSyncStatus, String> {
+    let (movie_path, transcript_path, offset_seconds) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT movie_path, transcript_path, transcript_offset_seconds FROM projects WHERE id = ?1",
+            params![project_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, f64>(2)?)),
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let transcript_path = transcript_path.ok_or("Project has no transcript".to_string())?;
+    let (_, entries) = transcript::parse_transcript(Path::new(&transcript_path))?;
+    if entries.is_empty() {
+        return Err("Transcript parsed to zero entries".to_string());
+    }
+    let movie_duration_seconds = crate::ffmpeg::probe_duration_seconds(&movie_path)?;
+    let transcript_start_seconds = entries.iter().map(|e| e.start).fold(f64::MAX, f64::min);
+    let transcript_end_seconds = entries.iter().map(|e| e.end.max(e.start)).fold(0.0_f64, f64::max);
+
+    let end_mismatch = (transcript_end_seconds - movie_duration_seconds).abs() > SYNC_TOLERANCE_SECONDS;
+    let start_mismatch = transcript_start_seconds > SYNC_TOLERANCE_SECONDS;
+    Ok(TranscriptSyncStatus {
+        movie_duration_seconds,
+        transcript_start_seconds,
+        transcript_end_seconds,
+        offset_seconds,
+        mismatch: end_mismatch || start_mismatch,
+    })
+}
+
+/// Manual fix for a mismatched transcript — shifts every parsed timestamp by a constant
+/// number of seconds wherever the transcript is used for the subtitle overlay (both the
+/// in-app live preview and the final ffmpeg render). Does NOT retroactively move already-cut
+/// clip start/end boundaries or re-run AI analysis — those were decided from the transcript
+/// as it stood at Analyze time; re-syncing subtitles doesn't require redoing that.
+#[tauri::command]
+pub async fn set_transcript_offset(db: State<'_, Db>, project_id: String, offset_seconds: f64) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM projects WHERE id = ?1", params![id])
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE projects SET transcript_offset_seconds = ?1, updated_at = datetime('now') WHERE id = ?2",
+        params![offset_seconds, project_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_project(app: AppHandle, db: State<'_, Db>, id: String) -> Result<(), String> {
+    let (movie_path, transcript_path, clip_ids) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let (movie_path, transcript_path): (String, Option<String>) = conn
+            .query_row(
+                "SELECT movie_path, transcript_path FROM projects WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM clips WHERE project_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let clip_ids: Vec<String> = stmt
+            .query_map(params![id], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM projects WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        (movie_path, transcript_path, clip_ids)
+    };
+
+    // Cascading FKs already dropped the DB rows (clips, ai_cache, upload_queue,
+    // render_queue) — this removes the actual bytes on disk that nothing references any
+    // more, so storage doesn't quietly accumulate every deleted project's
+    // renders/thumbnails/downloads forever.
+    if let Ok(app_data_dir) = app.path().app_data_dir() {
+        let _ = std::fs::remove_file(app_data_dir.join("thumbnails").join(format!("{id}.jpg")));
+
+        for clip_id in &clip_ids {
+            let _ = std::fs::remove_file(app_data_dir.join("thumbnails").join(format!("{clip_id}.jpg")));
+            let _ = std::fs::remove_file(app_data_dir.join("renders").join(format!("{clip_id}.mp4")));
+            // Final renders are named "<clip_id>_<template_id>.mp4" — the template id isn't
+            // known here, so sweep the directory for anything with this clip's prefix.
+            if let Ok(entries) = std::fs::read_dir(app_data_dir.join("renders").join("final")) {
+                for entry in entries.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with(&format!("{clip_id}_")) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+
+        // Only remove the source video/transcript when they're a copy this app made itself
+        // (e.g. a YouTube import under youtube_downloads) — never a user-picked file living
+        // elsewhere on disk, which this project doesn't own and which the user may still
+        // want or reuse in another project.
+        let youtube_downloads_dir = app_data_dir.join("youtube_downloads");
+        for path_str in [Some(movie_path), transcript_path].into_iter().flatten() {
+            let path = std::path::PathBuf::from(&path_str);
+            if path.starts_with(&youtube_downloads_dir) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -296,6 +438,20 @@ fn emit_progress(app: &AppHandle, project_id: &str, mode: &str, stage: &str, pro
             mode: mode.to_string(),
             stage: stage.to_string(),
             progress,
+            detail: None,
+        },
+    );
+}
+
+fn emit_detail(app: &AppHandle, project_id: &str, mode: &str, message: &str) {
+    let _ = app.emit(
+        "project_analysis_progress",
+        ProjectAnalysisProgress {
+            project_id: project_id.to_string(),
+            mode: mode.to_string(),
+            stage: "ai_status".to_string(),
+            progress: -1.0,
+            detail: Some(message.to_string()),
         },
     );
 }
@@ -362,6 +518,7 @@ pub async fn analyze_clips(
 
     emit_progress(&app, &id, "clips", "smart_trimmer", 0.2);
     let trim_result = call_ai_tracked(
+        &app,
         &ai,
         &registry,
         &registry_key(&id, "clips"),
@@ -409,6 +566,7 @@ pub async fn analyze_clips(
 
     emit_progress(&app, &id, "clips", "clip_finder", 0.5);
     let clip_result = call_ai_tracked(
+        &app,
         &ai,
         &registry,
         &registry_key(&id, "clips"),
@@ -522,6 +680,7 @@ pub async fn analyze_movie(
     // AI conversations don't contend or cross-talk.
     emit_progress(&app, &id, "movie", "smart_trimmer", 0.2);
     let trim_result = call_ai_tracked(
+        &app,
         &ai,
         &registry,
         &registry_key(&id, "movie"),
@@ -568,6 +727,7 @@ pub async fn analyze_movie(
 
     emit_progress(&app, &id, "movie", "movie_segmenter", 0.5);
     let segment_result = call_ai_tracked(
+        &app,
         &ai,
         &registry,
         &registry_key(&id, "movie"),
@@ -686,7 +846,7 @@ async fn backfill_missing_captions(
     let total = clip_ids.len().max(1);
     for (i, clip_id) in clip_ids.iter().enumerate() {
         emit_progress(app, project_id, mode, "captions", 0.9 + 0.09 * ((i + 1) as f64 / total as f64));
-        if let Err(e) = generate_and_save_caption(ai, db, registry, caption_locks, project_id, mode, clip_id).await {
+        if let Err(e) = generate_and_save_caption(app, ai, db, registry, caption_locks, project_id, mode, clip_id).await {
             if e.contains("Cancelled by user") {
                 break;
             }
@@ -708,6 +868,7 @@ async fn backfill_missing_captions(
 /// the pileup at the root, and the `res.error` checks added to orchestrator.js turn any
 /// future failure into a real, readable error instead of that crash.
 async fn generate_and_save_caption(
+    app: &AppHandle,
     ai: &Arc<AiClient>,
     db: &State<'_, Db>,
     registry: &AnalysisRegistry,
@@ -733,6 +894,7 @@ async fn generate_and_save_caption(
     };
 
     let result = call_ai_tracked(
+        app,
         ai,
         registry,
         &registry_key(project_id, mode),
@@ -774,6 +936,7 @@ async fn generate_and_save_caption(
 /// the manual "Generate with AI" button's command.
 #[tauri::command]
 pub async fn generate_clip_caption(
+    app: AppHandle,
     db: State<'_, Db>,
     ai: State<'_, Arc<AiClient>>,
     registry: State<'_, AnalysisRegistry>,
@@ -785,7 +948,7 @@ pub async fn generate_clip_caption(
         conn.query_row("SELECT project_id FROM clips WHERE id = ?1", params![clip_id], |row| row.get(0))
             .map_err(|e| e.to_string())?
     };
-    generate_and_save_caption(&ai, &db, &registry, &caption_locks, &project_id, "caption", &clip_id).await
+    generate_and_save_caption(&app, &ai, &db, &registry, &caption_locks, &project_id, "caption", &clip_id).await
 }
 
 /// "Generate all missing captions" button's command — same per-clip work
@@ -826,6 +989,7 @@ pub struct RefinedCaption {
 /// rather than continuing the same conversation that generated them one at a time.
 #[tauri::command]
 pub async fn refine_captions(
+    app: AppHandle,
     db: State<'_, Db>,
     ai: State<'_, Arc<AiClient>>,
     registry: State<'_, AnalysisRegistry>,
@@ -863,6 +1027,7 @@ pub async fn refine_captions(
         .collect();
 
     let result = call_ai_tracked(
+        &app,
         &ai,
         &registry,
         &registry_key(&project_id, mode),
@@ -907,12 +1072,14 @@ pub async fn refine_captions(
 /// `queue_manager.rs`) without re-fetching per clip.
 #[tauri::command]
 pub async fn fetch_trending_hashtags(
+    app: AppHandle,
     db: State<'_, Db>,
     ai: State<'_, Arc<AiClient>>,
     registry: State<'_, AnalysisRegistry>,
     project_id: String,
 ) -> Result<Vec<String>, String> {
     let result = call_ai_tracked(
+        &app,
         &ai,
         &registry,
         &registry_key(&project_id, "trending-hashtags"),

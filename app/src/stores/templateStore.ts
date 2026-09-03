@@ -21,6 +21,24 @@ export interface CaptionOverlayConfig {
   alignment: Alignment;
 }
 
+// Same shape as CaptionOverlayConfig minus `text` (and `anchor`, which caption never actually
+// applies — see ffmpeg.rs's render_final doc comment) — the text for each on-screen instant
+// comes from the project's transcript at render time, one line at a time as playback reaches
+// it. Only styling/position is authored here, exactly like dragging the caption box.
+export interface SubtitleOverlayConfig {
+  enabled: boolean;
+  fontFamily: string;
+  fontSize: number;
+  fontWeight: "normal" | "bold";
+  fontColor: string;
+  backgroundColor: string;
+  backgroundOpacity: number;
+  padding: number;
+  position: { x: number; y: number };
+  maxWidth: number;
+  alignment: Alignment;
+}
+
 export interface TemplateConfig {
   version: 2;
   platform: Platform;
@@ -48,6 +66,8 @@ export interface TemplateConfig {
   // {ai_caption} hook, caption2 an auto "{part_number}"-based label for Full Movie mode.
   // Both have their own enabled flag/text/position/styling.
   caption2: CaptionOverlayConfig;
+  // Transcript-synced subtitle track — see SubtitleOverlayConfig's doc comment.
+  subtitle: SubtitleOverlayConfig;
   encoding: {
     codec: "h264" | "h265";
     crf: number;
@@ -100,6 +120,19 @@ export function defaultTemplateConfig(platform: Platform = "tiktok"): TemplateCo
       anchor: "top-left",
       maxWidth: 880,
       alignment: "left",
+    },
+    subtitle: {
+      enabled: false,
+      fontFamily: "Arial",
+      fontSize: 56,
+      fontWeight: "bold",
+      fontColor: "#ffffff",
+      backgroundColor: "#000000",
+      backgroundOpacity: 0.45,
+      padding: 12,
+      position: { x: 0.1, y: 0.5 },
+      maxWidth: 880,
+      alignment: "center",
     },
     encoding: {
       codec: "h264",
@@ -165,6 +198,7 @@ export const useTemplateStore = create<TemplateStore>((set, get) => ({
         ...parsed,
         caption: { ...defaults.caption, ...parsed.caption },
         caption2: { ...defaults.caption2, ...parsed.caption2 },
+        subtitle: { ...defaults.subtitle, ...parsed.subtitle },
       };
       set({ currentTemplate: template, canvasState, isLoading: false });
     } catch (error) {
