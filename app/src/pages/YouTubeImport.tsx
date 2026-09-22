@@ -123,13 +123,10 @@ export default function YouTubeImport() {
 
   const [selected, setSelected] = useState<VideoSearchResult | null>(null);
   const [details, setDetails] = useState<VideoDetails | null>(null);
-  const [captions, setCaptions] = useState<string | null | undefined>(undefined); // undefined = not fetched yet
+  const [captions, setCaptions] = useState<string | null | undefined>(undefined);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
 
-  // Downloads happen in the shared tray (Layout's Downloads button), not this page — this
-  // just looks up the selected video's own entry (if any) to show inline progress/controls
-  // without duplicating the download logic.
   const { downloads, initListeners, fetchDownloads, startDownload, pauseDownload, resumeDownload, cancelDownload } =
     useDownloadsStore();
   const activeDownload = selected ? downloads.find((d) => d.videoId === selected.videoId) : undefined;
@@ -161,14 +158,11 @@ export default function YouTubeImport() {
     }
   }
 
-  // YouTube's own filters apply immediately on change, not just on the next Search click —
-  // matched here, but only once a search has actually run so changing filters before typing
-  // anything doesn't silently fire a request.
   useEffect(() => {
     if (hasSearched && query.trim()) {
       runSearch();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [sortOrder, durationFilter, uploadDateFilter]);
 
   async function selectVideo(video: VideoSearchResult) {
@@ -196,9 +190,6 @@ export default function YouTubeImport() {
     await startDownload(selected.videoId, selected.title, selected.thumbnailUrl);
   }
 
-  // Rough caption excerpt for the preview panel — the SRT text is imported verbatim as the
-  // project's transcript file, this is just so the user can sanity-check a video actually
-  // has usable captions before spending time downloading it.
   const captionPreview = captions
     ? captions
         .split("\n\n")
@@ -353,8 +344,7 @@ export default function YouTubeImport() {
 
           {selected && (
             <div className="w-[400px] shrink-0 rounded-lg border border-neutral-800 bg-neutral-900 p-4 h-fit sticky top-4 space-y-3">
-              {/* Real player (not just the thumbnail) so you can actually watch it and
-                  decide it's worth downloading before spending the time/bandwidth. */}
+              { }
               <div className="aspect-video rounded overflow-hidden bg-black">
                 <iframe
                   key={selected.videoId}

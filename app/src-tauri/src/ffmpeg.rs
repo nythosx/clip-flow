@@ -1,11 +1,7 @@
-// FFmpeg wrapper: Phase 3's minimal preview trim, plus Phase 4's template-based final
-// render (SPEC.md sections 4/5). Shells out to a system-installed `ffmpeg` on PATH — no
-// bundling yet (SPEC.md section 1/17 is future work).
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Resolves `ffmpeg` via PATH. No settings-table override yet — not required for v1.
 pub fn ffmpeg_path() -> Result<PathBuf, String> {
     Command::new("ffmpeg")
         .arg("-version")
@@ -14,14 +10,6 @@ pub fn ffmpeg_path() -> Result<PathBuf, String> {
         .map_err(|_| "ffmpeg not found on PATH — install it (e.g. `winget install Gyan.FFmpeg`) and restart the app".to_string())
 }
 
-/// Some FFmpeg builds compiled with fontconfig support but no configured `fonts.conf` print
-/// "Fontconfig error: Cannot load default config file" the moment `drawtext` initializes —
-/// and at least one build tested against this app (gyan.dev's `ffmpeg 9.0-full_build`)
-/// doesn't just error, it segfaults on literally any `drawtext` call, reproduced with a
-/// trivial one-frame `color` source input completely independent of anything this app
-/// constructs. Pointing `FONTCONFIG_FILE` at a trivial-but-valid config is the standard
-/// workaround for the missing-config case; it does NOT fix a build that's simply broken
-/// (that needs a different FFmpeg build), but it's a correct, harmless thing to always set.
 fn fontconfig_conf_path() -> Option<PathBuf> {
     let path = std::env::temp_dir().join("clipflow-fontconfig").join("fonts.conf");
     if path.exists() {
@@ -43,11 +31,6 @@ fn with_fontconfig_env(cmd: &mut Command) {
     }
 }
 
-/// Stream-copies `[start_seconds, end_seconds)` out of `movie_path` into `output_path`.
-///
-/// `-ss` before `-i` is a fast seek that can land on the nearest keyframe rather than the
-/// exact frame — acceptable for a preview; frame-accurate trimming (`-ss` after `-i`) is
-/// slower and not needed unless drift becomes a real complaint.
 pub fn extract_clip(
     movie_path: &str,
     start_seconds: f64,
@@ -82,11 +65,6 @@ pub fn extract_clip(
     Ok(())
 }
 
-/// Probes `movie_path`'s real duration by asking ffmpeg to open it with no output — it
-/// exits non-zero in that mode (expected, not a failure) but still prints a `Duration:
-/// HH:MM:SS.ms, ...` line to stderr while probing the container. Used to sanity-check a
-/// transcript's timestamps against how long the movie file actually is (see
-/// commands::project::get_transcript_sync_status) — no ffprobe binary required.
 pub fn probe_duration_seconds(movie_path: &str) -> Result<f64, String> {
     let ffmpeg = ffmpeg_path()?;
     let output = Command::new(ffmpeg)
@@ -108,8 +86,6 @@ fn parse_duration_line(stderr: &str) -> Option<f64> {
     }
 }
 
-/// Grabs a single frame at `seek_seconds` as a JPEG thumbnail, scaled to 320px wide. Used
-/// for the movie thumbnail and per-clip timeline thumbnails in the project editor UI.
 pub fn extract_thumbnail(movie_path: &str, seek_seconds: f64, output_path: &Path) -> Result<(), String> {
     let ffmpeg = ffmpeg_path()?;
     if let Some(parent) = output_path.parent() {
@@ -141,8 +117,6 @@ pub fn extract_thumbnail(movie_path: &str, seek_seconds: f64, output_path: &Path
     Ok(())
 }
 
-// TemplateConfig (SPEC.md section 4) — mirrors the frontend's TypeScript interface that
-// the Konva canvas serializes to. Deserialized straight from templates.config_json.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TemplateConfig {
@@ -150,17 +124,8 @@ pub struct TemplateConfig {
     pub transform: TransformConfig,
     pub watermark: WatermarkConfig,
     pub caption: CaptionConfig,
-    // Independent second caption overlay — e.g. caption is a manually-typed or
-    // `{ai_caption}` hook, caption2 an auto "Part {part_number}" label for Full Movie
-    // mode — each with its own enabled flag, text, position and styling. Defaults to
-    // disabled/empty for templates saved before this field existed.
     #[serde(default = "default_caption2")]
     pub caption2: CaptionConfig,
-    // Transcript-synced subtitle track — unlike `caption`/`caption2`'s fixed text, its text
-    // comes from the project's transcript entries overlapping this clip's time range (see
-    // `commands::render::render_clip_final_inner`), one at a time as the clip plays. Only
-    // styling/position is authored on the template; defaults to disabled for templates saved
-    // before this field existed.
     #[serde(default = "default_subtitle")]
     pub subtitle: SubtitleConfig,
     pub encoding: EncodingConfig,
@@ -177,15 +142,10 @@ pub struct OutputConfig {
 pub struct TransformConfig {
     pub mirror: bool,
     pub revert: bool,
-    pub rotation: u32, // 0 | 90 | 180 | 270
-    pub scaling: String, // 'fit' | 'fill' | 'stretch' | 'zoom'
-    // Focus point (0-1 fraction of the frame) used as the crop anchor when scaling is
-    // "fill" or "zoom" — defaults to centered for templates saved before this field existed.
+    pub rotation: u32,
+    pub scaling: String,
     #[serde(default = "default_crop")]
     pub crop: Point,
-    // 0-1: how far to blend from "fit" (0, fully visible, letterboxed) to "fill" (1, no
-    // letterbox, max side crop) when scaling is "zoom" — defaults to centered/half blend
-    // for templates saved before this field existed.
     #[serde(default = "default_zoom")]
     pub zoom: f64,
 }
@@ -219,7 +179,6 @@ pub struct CaptionConfig {
     pub text: String,
     pub font_family: String,
     pub font_size: f64,
-    // 'normal' | 'bold' — defaults to 'normal' for templates saved before this field existed.
     #[serde(default = "default_font_weight")]
     pub font_weight: String,
     pub font_color: String,
@@ -228,7 +187,7 @@ pub struct CaptionConfig {
     pub padding: f64,
     pub position: Point,
     pub max_width: f64,
-    pub alignment: String, // 'left' | 'center' | 'right'
+    pub alignment: String,
 }
 
 fn default_caption2() -> CaptionConfig {
@@ -248,8 +207,6 @@ fn default_caption2() -> CaptionConfig {
     }
 }
 
-// Same shape as CaptionConfig minus `text` — the text for each on-screen instant comes from
-// the transcript at render time, not from a field authored on the template.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubtitleConfig {
@@ -264,7 +221,7 @@ pub struct SubtitleConfig {
     pub padding: f64,
     pub position: Point,
     pub max_width: f64,
-    pub alignment: String, // 'left' | 'center' | 'right'
+    pub alignment: String,
 }
 
 fn default_subtitle() -> SubtitleConfig {
@@ -292,11 +249,11 @@ pub struct Point {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodingConfig {
-    pub codec: String,          // 'h264' | 'h265'
-    pub crf: u32,                // 18-28
-    pub preset: String,          // 'ultrafast'..'medium'
-    pub max_resolution: u32,     // 480 | 720 | 1080 (height cap)
-    pub audio_bitrate: String,   // '128k' | '192k' | '256k'
+    pub codec: String,
+    pub crf: u32,
+    pub preset: String,
+    pub max_resolution: u32,
+    pub audio_bitrate: String,
 }
 
 fn escape_drawtext(text: &str) -> String {
@@ -305,13 +262,6 @@ fn escape_drawtext(text: &str) -> String {
         .replace('\'', "\u{2019}")
 }
 
-/// Rough per-character width as a fraction of font size, bucketed by glyph shape for a
-/// typical proportional sans/serif face — no font-shaping library is linked in here, so
-/// this can't measure real glyph widths. It replaces a flat 0.55x-of-size average that
-/// systematically underestimated width for caption text: captions skew ALL-CAPS (uppercase
-/// glyphs run much wider than the alphabet-wide average) and the average never varied with
-/// weight, so bold captions — wider than regular at the same size — wrapped too loosely and
-/// their lines overflowed the box on real fonts.
 fn char_width_fraction(c: char) -> f64 {
     if c == ' ' {
         0.28
@@ -326,24 +276,15 @@ fn char_width_fraction(c: char) -> f64 {
             _ => 0.5,
         }
     } else {
-        0.55 // punctuation, unicode, etc.
+        0.55
     }
 }
 
-/// Estimated rendered width of `text` at `size_px`, per [`char_width_fraction`]. `bold`
-/// applies a flat ~8% widening — a bold cut of a face is reliably wider than its regular
-/// cut at the same point size, which the estimate needs to account for since
-/// [`resolve_font_file`] switches to an actual bold font file when `font_weight` is bold.
 fn estimate_text_width_px(text: &str, size_px: f64, bold: bool) -> f64 {
     let width: f64 = text.chars().map(|c| char_width_fraction(c) * size_px).sum();
     if bold { width * 1.08 } else { width }
 }
 
-/// Greedily word-wraps `text` to fit `max_width_px` per line — ffmpeg's `drawtext` has no
-/// built-in auto-wrap (unlike Konva's `Text` with a `width` prop, which wraps using real
-/// measured glyph widths), so a long caption previously just drew as one line and ran past
-/// its own box/the frame edge regardless of `maxWidth`. Existing `\n`s in the source text
-/// are preserved as hard paragraph breaks.
 fn wrap_caption_text(text: &str, max_width_px: f64, size_px: f64, bold: bool) -> Vec<String> {
     let max_width_px = max_width_px.max(1.0);
     let space_width = estimate_text_width_px(" ", size_px, bold);
@@ -373,16 +314,6 @@ fn wrap_caption_text(text: &str, max_width_px: f64, size_px: f64, bold: bool) ->
     lines
 }
 
-/// Builds a `drawbox=...,drawtext=...` filter pair for a text overlay — shared by `caption`,
-/// `caption2`, and each subtitle cue, which differ only in their text and (for subtitles)
-/// an `enable_range` gating when that cue is visible, not in how a text box gets burned in.
-/// Mirrors the Konva preview's layout exactly (`TemplateEditor.tsx`'s `Group`/`Rect`/
-/// `KonvaText`): a fixed `maxWidth`-wide box (not a text-width-dependent one — that was an
-/// earlier bug where `alignment` had no effect on the render) placed edge-relative per
-/// `position.{x,y}` (see below), with `alignment` placing the text horizontally inside that
-/// box. `enable_range`, when set, gates both the box and the text to `[start, end)` seconds
-/// of the *output* stream's timeline (which `-ss` before `-i` already zeroes at the trim
-/// point — see `render_final`), so a subtitle cue only shows while its line is being said.
 #[allow(clippy::too_many_arguments)]
 fn build_text_box_filter(
     text: &str,
@@ -408,27 +339,10 @@ fn build_text_box_filter(
     let bold = font_weight.eq_ignore_ascii_case("bold");
     let wrapped_lines = wrap_caption_text(text, (box_w - pad * 2.0).max(1.0), size as f64, bold);
     let wrapped_text = wrapped_lines.join("\n");
-    // ffmpeg's default line spacing (no `line_spacing` override) is close to 1.2x the font
-    // size for most fonts — matches this box-height estimate closely enough to avoid the
-    // background box clipping the last line or leaving a big gap under a short caption.
     let line_height = size as f64 * 1.2;
     let box_h = wrapped_lines.len() as f64 * line_height + pad * 2.0;
-    // Edge-relative placement — `position.{x,y}` is where the box's *own* edge sits between
-    // the frame's edges (0 = box's left/top flush with the frame's, 1 = box's right/bottom
-    // flush with the frame's), the same basis the watermark's `(main_w-overlay_w)*x` overlay
-    // filter and the live CSS preview (ProjectDetail.tsx's CaptionOverlayBlock) both already
-    // use. It used to be `position.x * output_width` — a *full-width* basis under which a
-    // box dragged near an edge could end up hanging off the frame entirely once its own
-    // width/height was added on. Alignment only repositions text *inside* the box, so a box
-    // already off-frame made "left/center/right" look like it had no effect at all — the
-    // box's own placement, not the alignment math, was the actual bug. This also made the
-    // live preview (already edge-relative) not match what ffmpeg actually rendered.
     let box_x = position.x * (output_width as f64 - box_w).max(0.0);
     let box_y = position.y * (output_height as f64 - box_h).max(0.0);
-    // Positions the overall (possibly multi-line) text block — `text_w` is the widest
-    // wrapped line's width, so this places that widest line as intended. `text_align` below
-    // additionally aligns any *shorter* lines within that same block, which `x` alone can't
-    // do since drawtext only evaluates one `x` expression for the whole block.
     let text_x = match alignment {
         "center" => format!("{box_x}+({box_w}-text_w)/2"),
         "right" => format!("{box_x}+{box_w}-text_w-{pad}"),
@@ -439,8 +353,6 @@ fn build_text_box_filter(
         "right" => "right",
         _ => "left",
     };
-    // Quoted (like `text='...'` below) so the comma-separated arguments inside don't get
-    // read as filter/chain separators by ffmpeg's filtergraph parser.
     let enable = enable_range
         .map(|(start, end)| format!(":enable='between(t,{start},{end})'"))
         .unwrap_or_default();
@@ -454,8 +366,6 @@ fn build_text_box_filter(
     )
 }
 
-/// Thin wrapper over [`build_text_box_filter`] for a fixed-text caption (`caption`/
-/// `caption2`) — no `enable_range`, so it's visible for the whole clip.
 fn caption_drawtext_filter(cap: &CaptionConfig, output_width: u32, output_height: u32) -> String {
     build_text_box_filter(
         &cap.text,
@@ -475,48 +385,6 @@ fn caption_drawtext_filter(cap: &CaptionConfig, output_width: u32, output_height
     )
 }
 
-/// Builds one `build_text_box_filter` call per subtitle cue, each gated to its own
-/// `[start, end)` window via `enable_range` so only one line (per overlapping cue) is ever
-/// on screen at a time. `cues` are already clip-relative and clamped to the clip's own
-/// duration — see `commands::render::render_clip_final_inner`, which reads the project's
-/// transcript and does that shifting before calling `render_final`. Empty/whitespace-only
-/// cue text is skipped rather than burning in a blank box.
-fn subtitle_drawtext_filters(
-    sub: &SubtitleConfig,
-    cues: &[(f64, f64, String)],
-    output_width: u32,
-    output_height: u32,
-) -> Vec<String> {
-    cues
-        .iter()
-        .filter(|(_, _, text)| !text.trim().is_empty())
-        .map(|(start, end, text)| {
-            build_text_box_filter(
-                text,
-                &sub.font_family,
-                sub.font_size,
-                &sub.font_weight,
-                &sub.font_color,
-                &sub.background_color,
-                sub.background_opacity,
-                sub.padding,
-                &sub.position,
-                sub.max_width,
-                &sub.alignment,
-                output_width,
-                output_height,
-                Some((*start, *end)),
-            )
-        })
-        .collect()
-}
-
-/// Resolves a font family name to an actual font file for drawtext's `fontfile=`. Using
-/// `font=<name>` (fontconfig lookup) is more portable in principle, but this machine's
-/// FFmpeg build has fontconfig compiled in without a configured `fonts.conf`, so lookups
-/// fail at runtime ("Cannot load default config file"). `fontfile=` sidesteps that and
-/// matches SPEC.md section 5's original pseudocode. Windows-only mapping for now — revisit
-/// alongside cross-platform FFmpeg bundling (SPEC.md section 17, not started).
 fn resolve_font_file(font_family: &str, font_weight: &str) -> PathBuf {
     let windows_fonts = PathBuf::from(r"C:\Windows\Fonts");
     let bold = font_weight.eq_ignore_ascii_case("bold") || font_family.eq_ignore_ascii_case("arial bold");
@@ -527,7 +395,6 @@ fn resolve_font_file(font_family: &str, font_weight: &str) -> PathBuf {
         ("times new roman", false) | ("times", false) => "times.ttf",
         ("courier new", true) | ("courier", true) => "courbd.ttf",
         ("courier new", false) | ("courier", false) => "cour.ttf",
-        // Impact has no distinct bold cut on Windows — already a heavy display face.
         ("impact", _) => "impact.ttf",
         ("comic sans ms", true) => "comicbd.ttf",
         ("comic sans ms", false) => "comic.ttf",
@@ -541,29 +408,100 @@ fn resolve_font_file(font_family: &str, font_weight: &str) -> PathBuf {
     windows_fonts.join(file)
 }
 
-/// Runs a clip through the full template pipeline (SPEC.md section 5): trim, scale/crop,
-/// mirror/revert/rotate, watermark overlay, caption burn-in, encode. Known simplifications
-/// vs. the full spec, acceptable for v1 — revisit only if a real template needs them:
-/// - Caption `anchor` isn't applied; position.{x,y} directly drives a fractional x/y via
-///   drawtext's `text_w`/`text_h`, which already approximates most anchors reasonably.
-/// - Watermark `anchor` is likewise approximated by `position` alone.
-pub fn render_final(
-    movie_path: &str,
-    start_seconds: f64,
-    end_seconds: f64,
-    template: &TemplateConfig,
-    // Transcript entries overlapping this clip, already shifted to clip-relative seconds by
-    // the caller (see `commands::render::render_clip_final_inner`). Ignored unless
-    // `template.subtitle.enabled`.
-    subtitle_cues: &[(f64, f64, String)],
-    output_path: &Path,
+fn format_ass_time(seconds: f64) -> String {
+    let total_cs = (seconds.max(0.0) * 100.0).round() as u64;
+    let cs = total_cs % 100;
+    let total_secs = total_cs / 100;
+    let s = total_secs % 60;
+    let m = (total_secs / 60) % 60;
+    let h = total_secs / 3600;
+    format!("{}:{:02}:{:02}.{:02}", h, m, s, cs)
+}
+
+fn ass_color(hex: &str, opacity: f64) -> String {
+    let hex = hex.trim_start_matches('#');
+    let (r, g, b) = if hex.len() == 6 {
+        (
+            u8::from_str_radix(&hex[0..2], 16).unwrap_or(255),
+            u8::from_str_radix(&hex[2..4], 16).unwrap_or(255),
+            u8::from_str_radix(&hex[4..6], 16).unwrap_or(255),
+        )
+    } else {
+        (255, 255, 255)
+    };
+    let a = ((1.0 - opacity.clamp(0.0, 1.0)) * 255.0).round() as u8;
+    format!("&H{:02X}{:02X}{:02X}{:02X}", a, b, g, r)
+}
+
+fn escape_ass_text(text: &str) -> String {
+    text.replace('{', "\\{")
+        .replace('}', "\\}")
+        .replace('\n', "\\N")
+}
+
+fn build_ass_file(
+    sub: &SubtitleConfig,
+    cues: &[(f64, f64, String)],
+    w: u32,
+    h: u32,
+    path: &Path,
 ) -> Result<(), String> {
-    let ffmpeg = ffmpeg_path()?;
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create output dir: {e}"))?;
+    let font_scale = h as f64 / 1920.0;
+    let font_size = (sub.font_size * font_scale).round().max(1.0) as i64;
+    let padding = (sub.padding * font_scale).round().max(1.0) as i64;
+    let bold = if sub.font_weight.eq_ignore_ascii_case("bold") { -1 } else { 0 };
+    let primary = ass_color(&sub.font_color, 1.0);
+    let outline = ass_color(&sub.background_color, sub.background_opacity);
+    let back = ass_color(&sub.background_color, 0.0);
+
+    let mut content = String::new();
+    content.push_str("[Script Info]\n");
+    content.push_str("ScriptType: v4.00+\n");
+    content.push_str(&format!("PlayResX: {}\n", w));
+    content.push_str(&format!("PlayResY: {}\n", h));
+    content.push_str("WrapStyle: 0\n");
+    content.push_str("ScaledBorderAndShadow: yes\n");
+    content.push_str("YCbCr Matrix: TV.709\n\n");
+
+    content.push_str("[V4+ Styles]\n");
+    content.push_str("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n");
+    content.push_str(&format!(
+        "Style: Sub,{fn_},{fs},{pc},&H000000FF,{oc},{bc},{b},0,0,0,100,100,0,0,3,{pad},0,5,40,40,60,1\n",
+        fn_ = sub.font_family,
+        fs = font_size,
+        pc = primary,
+        oc = outline,
+        bc = back,
+        b = bold,
+        pad = padding,
+    ));
+
+    content.push_str("\n[Events]\n");
+    content.push_str("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
+
+    let max_w = sub.max_width * (w as f64 / 1080.0);
+    let cx = sub.position.x * (w as f64 - max_w) + max_w / 2.0;
+    let cy = sub.position.y * (h as f64);
+
+    for (start, end, text) in cues {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let escaped = escape_ass_text(text);
+        content.push_str(&format!(
+            "Dialogue: 0,{start},{end},Sub,,0,0,0,,{{\\an5\\pos({cx:.0},{cy:.0})}}{text}\n",
+            start = format_ass_time(*start),
+            end = format_ass_time(*end),
+            cx = cx,
+            cy = cy,
+            text = escaped,
+        ));
     }
 
-    let (w, h) = (template.output.width, template.output.height);
+    std::fs::write(path, content).map_err(|e| format!("failed to write ASS file: {e}"))
+}
+
+fn build_structural_filters(template: &TemplateConfig, w: u32, h: u32) -> (Vec<String>, String) {
     let mut filters: Vec<String> = Vec::new();
     let mut current = "0:v".to_string();
 
@@ -571,40 +509,30 @@ pub fn render_final(
         "fill" => {
             let cx = template.transform.crop.x.clamp(0.0, 1.0);
             let cy = template.transform.crop.y.clamp(0.0, 1.0);
-            format!(
+            Some(format!(
                 "scale=w={w}:h={h}:force_original_aspect_ratio=increase,crop=w={w}:h={h}:x=(in_w-{w})*{cx}:y=(in_h-{h})*{cy}"
-            )
+            ))
         }
         "zoom" => {
             let cx = template.transform.crop.x.clamp(0.0, 1.0);
             let cy = template.transform.crop.y.clamp(0.0, 1.0);
             let z = template.transform.zoom.clamp(0.0, 1.0);
-            // Blends "fit"'s scale factor (min of the two fit ratios — fully visible,
-            // letterboxed) with "fill"'s (max of the two — no letterbox, full crop) by
-            // `z` instead of picking one outright, so raising zoom trades letterbox for a
-            // little side crop instead of jumping straight from one extreme to the other.
-            // Quoted since the expressions contain commas, which ffmpeg's filtergraph
-            // parser would otherwise read as the next filter/option separator.
             let fit = format!("min({w}/iw,{h}/ih)");
             let fill = format!("max({w}/iw,{h}/ih)");
             let factor = format!("({fit}+{z}*({fill}-{fit}))");
-            // `trunc(x/2)*2` forces an even pixel count — yuv420p's chroma subsampling
-            // requires it, and an odd scaled dimension exactly matching the pad target
-            // makes ffmpeg's pad filter fail with "Padded dimensions cannot be smaller
-            // than input dimensions" (confirmed against a real ffmpeg build: a 3413px-wide
-            // scale output raising that error at z=1, while the same width rounded up to
-            // 3414 works) even though the two values are mathematically equal.
-            format!(
+            Some(format!(
                 "scale=w='trunc(iw*{factor}/2)*2':h='trunc(ih*{factor}/2)*2',pad=w='max(iw,{w})':h='max(ih,{h})':x='(ow-iw)/2':y='(oh-ih)/2':color=black,crop=w={w}:h={h}:x=(in_w-{w})*{cx}:y=(in_h-{h})*{cy}"
-            )
+            ))
         }
-        "stretch" => format!("scale={w}:{h}"),
-        _ => format!(
+        "stretch" => Some(format!("scale={w}:{h}")),
+        _ => Some(format!(
             "scale=w={w}:h={h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black"
-        ),
+        )),
     };
-    filters.push(format!("[{current}]{scale_filter}[scaled]"));
-    current = "scaled".to_string();
+    if let Some(sf) = scale_filter {
+        filters.push(format!("[{current}]{sf}[scaled]"));
+        current = "scaled".to_string();
+    }
 
     if template.transform.mirror {
         filters.push(format!("[{current}]hflip[mirrored]"));
@@ -625,11 +553,8 @@ pub fn render_final(
         current = "rotated".to_string();
     }
 
-    let has_watermark = template.watermark.enabled && !template.watermark.image_path.is_empty();
-    if has_watermark {
+    if template.watermark.enabled && !template.watermark.image_path.is_empty() {
         let wm = &template.watermark;
-        // Watermark width is a fraction of the *output* width (matches the Konva canvas
-        // preview), not the watermark image's own raw pixel size.
         let watermark_width = (w as f64 * wm.scale).round() as i64;
         filters.push(format!(
             "[1:v]scale=w={ww}:h=-2,format=rgba,colorchannelmixer=aa={a}[wm]",
@@ -644,54 +569,174 @@ pub fn render_final(
         current = "watermarked".to_string();
     }
 
+    if filters.is_empty() {
+        return (Vec::new(), "0:v".to_string());
+    }
+    if current != "v_out" {
+        filters.push(format!("[{current}]null[v_out]"));
+        current = "v_out".to_string();
+    }
+    (filters, current)
+}
+
+fn build_overlay_chain(
+    template: &TemplateConfig,
+    subtitle_cues: &[(f64, f64, String)],
+    w: u32,
+    h: u32,
+    temp_dir: &Path,
+    ts: u128,
+) -> Result<(String, Vec<PathBuf>), String> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut temps: Vec<PathBuf> = Vec::new();
+
     if template.caption.enabled && !template.caption.text.is_empty() {
-        let drawtext = caption_drawtext_filter(&template.caption, w, h);
-        filters.push(format!("[{current}]{drawtext}[captioned]"));
-        current = "captioned".to_string();
+        chain.push(caption_drawtext_filter(&template.caption, w, h));
     }
     if template.caption2.enabled && !template.caption2.text.is_empty() {
-        let drawtext = caption_drawtext_filter(&template.caption2, w, h);
-        filters.push(format!("[{current}]{drawtext}[captioned2]"));
-        current = "captioned2".to_string();
+        chain.push(caption_drawtext_filter(&template.caption2, w, h));
     }
     if template.subtitle.enabled && !subtitle_cues.is_empty() {
-        for (i, drawtext) in subtitle_drawtext_filters(&template.subtitle, subtitle_cues, w, h).into_iter().enumerate() {
-            let label = format!("sub{i}");
-            filters.push(format!("[{current}]{drawtext}[{label}]"));
-            current = label;
-        }
+        let ass_name = format!("cf_ass_{ts}.ass");
+        let ass_path = temp_dir.join(&ass_name);
+        build_ass_file(&template.subtitle, subtitle_cues, w, h, &ass_path)?;
+        chain.push(format!("ass=filename={}", ass_name));
+        temps.push(ass_path);
     }
-
     if template.encoding.max_resolution < h {
-        filters.push(format!(
-            "[{current}]scale=-2:{}[resized]",
-            template.encoding.max_resolution
-        ));
-        current = "resized".to_string();
+        chain.push(format!("scale=-2:{}", template.encoding.max_resolution));
     }
 
-    let filter_complex = filters.join(";");
+    Ok((chain.join(","), temps))
+}
+
+pub fn render_final(
+    movie_path: &str,
+    start_seconds: f64,
+    end_seconds: f64,
+    template: &TemplateConfig,
+    subtitle_cues: &[(f64, f64, String)],
+    output_path: &Path,
+) -> Result<(), String> {
+    let ffmpeg = ffmpeg_path()?;
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create output dir: {e}"))?;
+    }
+
+    let (w, h) = (template.output.width, template.output.height);
+    let (structural_filters, structural_out) = build_structural_filters(template, w, h);
+    let has_watermark = template.watermark.enabled && !template.watermark.image_path.is_empty();
     let codec = match template.encoding.codec.as_str() {
         "h265" => "libx265",
         _ => "libx264",
     };
 
-    let mut cmd = Command::new(ffmpeg);
-    with_fontconfig_env(&mut cmd);
-    cmd.args(["-y", "-ss", &start_seconds.to_string(), "-to", &end_seconds.to_string(), "-i", movie_path]);
-    if has_watermark {
-        cmd.args(["-i", &template.watermark.image_path]);
-    }
-    cmd.args(["-filter_complex", &filter_complex]);
-    cmd.args(["-map", &format!("[{current}]"), "-map", "0:a?"]);
-    cmd.args(["-c:v", codec, "-crf", &template.encoding.crf.to_string(), "-preset", &template.encoding.preset]);
-    cmd.args(["-c:a", "aac", "-b:a", &template.encoding.audio_bitrate]);
-    cmd.arg(output_path);
+    let temp_dir = std::env::temp_dir();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
 
-    let output = cmd.output().map_err(|e| format!("failed to run ffmpeg: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg failed: {stderr}"));
+    let (overlay_chain, overlay_temps) = build_overlay_chain(template, subtitle_cues, w, h, &temp_dir, ts)?;
+
+    if overlay_chain.is_empty() {
+        let mut cmd = Command::new(&ffmpeg);
+        with_fontconfig_env(&mut cmd);
+        cmd.args(["-y", "-ss", &start_seconds.to_string(), "-to", &end_seconds.to_string(), "-i", movie_path]);
+        if has_watermark {
+            cmd.args(["-i", &template.watermark.image_path]);
+        }
+        if !structural_filters.is_empty() {
+            cmd.args(["-filter_complex", &structural_filters.join(";")]);
+            cmd.args(["-map", &format!("[{structural_out}]"), "-map", "0:a?"]);
+        } else {
+            cmd.args(["-map", "0:v", "-map", "0:a?"]);
+        }
+        cmd.args(["-c:v", codec, "-crf", &template.encoding.crf.to_string(), "-preset", &template.encoding.preset]);
+        cmd.args(["-c:a", "aac", "-b:a", &template.encoding.audio_bitrate]);
+        cmd.arg(output_path);
+        let output = cmd.output().map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+        for t in &overlay_temps {
+            let _ = std::fs::remove_file(t);
+        }
+        if !output.status.success() {
+            return Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+        return Ok(());
     }
-    Ok(())
+
+    if structural_filters.is_empty() {
+        let mut cmd = Command::new(&ffmpeg);
+        with_fontconfig_env(&mut cmd);
+        cmd.current_dir(&temp_dir);
+        cmd.args(["-y", "-ss", &start_seconds.to_string(), "-to", &end_seconds.to_string(), "-i", movie_path]);
+        cmd.args(["-vf", &overlay_chain]);
+        cmd.args(["-c:v", codec, "-crf", &template.encoding.crf.to_string(), "-preset", &template.encoding.preset]);
+        cmd.args(["-c:a", "aac", "-b:a", &template.encoding.audio_bitrate]);
+        cmd.arg(output_path);
+        let output = cmd.output().map_err(|e| format!("failed to run ffmpeg: {e}"))?;
+        for t in &overlay_temps {
+            let _ = std::fs::remove_file(t);
+        }
+        if !output.status.success() {
+            return Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+        return Ok(());
+    }
+
+    let pass1_name = format!("cf_pass1_{ts}.mkv");
+    let pass1_path = temp_dir.join(&pass1_name);
+
+    {
+        let mut cmd = Command::new(&ffmpeg);
+        with_fontconfig_env(&mut cmd);
+        cmd.current_dir(&temp_dir);
+        cmd.args(["-y", "-ss", &start_seconds.to_string(), "-to", &end_seconds.to_string(), "-i", movie_path]);
+        if has_watermark {
+            cmd.args(["-i", &template.watermark.image_path]);
+        }
+        cmd.args(["-filter_complex", &structural_filters.join(";")]);
+        cmd.args(["-map", &format!("[{structural_out}]"), "-map", "0:a?"]);
+        cmd.args(["-c:v", "libx264", "-crf", "14", "-preset", "ultrafast"]);
+        cmd.args(["-c:a", "copy"]);
+        cmd.arg(&pass1_name);
+        let output = cmd.output().map_err(|e| {
+            let _ = std::fs::remove_file(&pass1_path);
+            for t in &overlay_temps {
+                let _ = std::fs::remove_file(t);
+            }
+            format!("failed to run ffmpeg (pass 1): {e}")
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_file(&pass1_path);
+            for t in &overlay_temps {
+                let _ = std::fs::remove_file(t);
+            }
+            return Err(format!("ffmpeg failed (pass 1): {stderr}"));
+        }
+    }
+
+    let result = {
+        let mut cmd = Command::new(&ffmpeg);
+        with_fontconfig_env(&mut cmd);
+        cmd.current_dir(&temp_dir);
+        cmd.args(["-y", "-i", &pass1_name]);
+        cmd.args(["-vf", &overlay_chain]);
+        cmd.args(["-c:v", codec, "-crf", &template.encoding.crf.to_string(), "-preset", &template.encoding.preset]);
+        cmd.args(["-c:a", "aac", "-b:a", &template.encoding.audio_bitrate]);
+        cmd.arg(output_path);
+        let output = cmd.output().map_err(|e| format!("failed to run ffmpeg (pass 2): {e}"))?;
+        if !output.status.success() {
+            Err(format!("ffmpeg failed (pass 2): {}", String::from_utf8_lossy(&output.stderr)))
+        } else {
+            Ok(())
+        }
+    };
+
+    let _ = std::fs::remove_file(&pass1_path);
+    for t in &overlay_temps {
+        let _ = std::fs::remove_file(t);
+    }
+    result
 }

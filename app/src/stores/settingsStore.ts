@@ -10,10 +10,9 @@ export const SETTING_YOUTUBE_CLIENT_SECRET = "youtube_client_secret";
 export const SETTING_YOUTUBE_API_KEY = "youtube_api_key";
 export const SETTING_FACEBOOK_APP_ID = "facebook_app_id";
 export const SETTING_FACEBOOK_APP_SECRET = "facebook_app_secret";
-// "true"/"false" (as a settings-table string, not a real bool) — master on/off for both the
-// voice-line and SFX playback in lib/soundManager.ts.
+
 export const SETTING_SOUND_ALERTS_ENABLED = "sound_alerts_enabled";
-export const SETTING_VOICE_GENDER = "voice_gender"; // "male" | "female"
+export const SETTING_VOICE_GENDER = "voice_gender";
 
 interface SettingsStore {
   settings: Record<string, string>;

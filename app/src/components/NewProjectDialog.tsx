@@ -32,9 +32,6 @@ export default function NewProjectDialog({
     if (path) setTranscriptPath(path);
   }
 
-  // Basename without extension, e.g. "C:\...\Thrash-1080P.mp4" -> "Thrash-1080P" — used when
-  // the user leaves the name field blank instead of falling back to a generic "Untitled
-  // project" for every clip.
   function nameFromPath(path: string): string {
     const base = path.split(/[\\/]/).pop() ?? path;
     return base.replace(/\.[^.]+$/, "");

@@ -5,10 +5,6 @@ use serde::Serialize;
 use std::sync::Mutex;
 use tauri::AppHandle;
 
-/// Tracks the loopback listener task from the most recent `connect_tiktok_account` call.
-/// Retrying (new browser tab, different account, etc.) while a prior attempt is still
-/// waiting on port OAUTH_REDIRECT_PORT used to fail with "address already in use" — this
-/// aborts the stale attempt first so the port is always free for a fresh one.
 #[derive(Default)]
 pub struct TikTokOAuthState(pub Mutex<Option<tokio::task::AbortHandle>>);
 
@@ -74,10 +70,6 @@ pub async fn delete_account(db: tauri::State<'_, Db>, id: String) -> Result<(), 
     Ok(())
 }
 
-/// Runs the full TikTok OAuth (Login Kit) flow: opens the system browser to TikTok's
-/// consent screen, catches the redirect on a loopback listener, exchanges the code for
-/// tokens, and upserts an `accounts` row keyed by TikTok's `open_id` so reconnecting the
-/// same account refreshes its tokens instead of creating a duplicate.
 #[tauri::command]
 pub async fn connect_tiktok_account(
     app: AppHandle,
@@ -95,8 +87,6 @@ pub async fn connect_tiktok_account(
         (get("tiktok_client_key")?, get("tiktok_client_secret")?)
     };
 
-    // Abort whatever previous attempt might still be holding the loopback port — e.g. the
-    // user opened the wrong browser account, or the last try never got a redirect at all.
     if let Some(prev) = oauth_state.0.lock().map_err(|e| e.to_string())?.take() {
         prev.abort();
     }
@@ -138,10 +128,7 @@ pub async fn connect_tiktok_account(
     .to_string();
 
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    // Reconnecting the same TikTok account (retry after a token expired, or just clicking
-    // "Connect with TikTok" again) must update the existing row instead of erroring or
-    // inserting a duplicate — keyed on TikTok's own `open_id`, which is stable per account,
-    // rather than display_name (which the user can change on TikTok's side at any time).
+
     let existing_id: Option<String> = conn
         .query_row(
             "SELECT id FROM accounts WHERE platform = 'tiktok' AND json_extract(credentials_json, '$.openId') = ?1",

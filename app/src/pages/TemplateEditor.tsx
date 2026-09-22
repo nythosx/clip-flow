@@ -24,9 +24,6 @@ const SECTIONS: { id: SectionId; label: string; icon: typeof Smartphone }[] = [
   { id: "encoding", label: "Encoding", icon: SlidersHorizontal },
 ];
 
-// Sample line shown only in the editor so the subtitle box has something to measure/drag —
-// at render time each transcript cue's own text takes its place (see ffmpeg.rs's
-// subtitle_drawtext_filters).
 const SUBTITLE_PREVIEW_SAMPLE = "Synced lyric line appears here";
 
 function formatDurationShort(seconds: number): string {
@@ -36,11 +33,6 @@ function formatDurationShort(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-// The caption background box previously used a fixed single-line height (fontSize +
-// padding*2), but KonvaText wraps to multiple lines once its content exceeds `width` — so
-// a long caption's text spilled below the box instead of the box growing to fit it. Konva's
-// own Text node already measures real wrapped-line height for these exact props, so reuse
-// it here instead of re-deriving an estimate.
 function measureCaptionBoxHeight(
   text: string,
   width: number,
@@ -77,9 +69,6 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-// Shared control set for a caption overlay — used twice (Caption 1 and the independent
-// Caption 2), differing only in which config object they read/write and their textarea
-// placeholder hint.
 function CaptionFields({
   caption,
   onChange,
@@ -170,9 +159,6 @@ function CaptionFields({
   );
 }
 
-// Same field set as CaptionFields minus the text box — subtitle text comes from the
-// project's transcript at render time (one cue at a time), not from anything typed here.
-// Drag the box in the canvas above to position it; these controls only cover its styling.
 function SubtitleFields({
   subtitle,
   onChange,
@@ -378,9 +364,7 @@ export default function TemplateEditor() {
   }
 
   // Edge-relative placement (matches ffmpeg.rs's caption_drawtext_filter and
-  // ProjectDetail.tsx's live CSS preview): position.{x,y} is where the box's own edge sits
-  // between the canvas's edges, not a fraction of the full canvas — so a box can never be
-  // dragged off-frame the way a full-width basis would allow once its own size is added on.
+
   const captionDisplayFontSize = canvasState.caption.fontSize * displayScale;
   const captionDisplayMaxWidth = canvasState.caption.maxWidth * displayScale;
   const captionDisplayPadding = canvasState.caption.padding * displayScale;
@@ -434,7 +418,7 @@ export default function TemplateEditor() {
 
   return (
     <div className="h-screen flex flex-col">
-      {/* Top toolbar */}
+      { }
       <div className="h-14 flex-shrink-0 flex items-center justify-between px-4 border-b border-black/40 bg-[#161618]">
         <div className="flex items-center gap-3 min-w-0">
           <button
@@ -465,7 +449,7 @@ export default function TemplateEditor() {
       </div>
 
       <div className="flex-1 flex min-h-0">
-        {/* Left tool rail */}
+        { }
         <div className="w-[72px] flex-shrink-0 bg-[#161618] border-r border-black/40 flex flex-col items-center py-3 gap-1">
           {SECTIONS.map(({ id: sectionId, label, icon: Icon }) => (
             <button
@@ -483,7 +467,7 @@ export default function TemplateEditor() {
           ))}
         </div>
 
-        {/* Center canvas workspace */}
+        { }
         <div className="flex-1 min-w-0 flex flex-col items-center justify-center bg-[#0a0a0b] p-6">
           <div className="flex items-center gap-2 mb-3">
             <select
@@ -700,7 +684,7 @@ export default function TemplateEditor() {
           </p>
         </div>
 
-        {/* Right properties panel — shows only the active section */}
+        { }
         <div className="w-[300px] flex-shrink-0 bg-[#161618] border-l border-black/40 p-4 overflow-y-auto space-y-3">
           {activeSection === "platform" && (
             <>

@@ -85,6 +85,8 @@ interface ProjectStore {
   createProject: (name: string, moviePath: string, transcriptPath: string) => Promise<string>;
   fetchProject: (projectId: string) => Promise<void>;
   fetchClips: (projectId: string) => Promise<void>;
+
+  renderAllMissingPreviews: (projectId: string) => void;
   analyzeClips: (projectId: string) => Promise<void>;
   analyzeMovie: (projectId: string) => Promise<void>;
   cancelAnalysis: (projectId: string, mode: "clips" | "movie") => Promise<void>;
@@ -94,16 +96,9 @@ interface ProjectStore {
   setTranscriptOffset: (projectId: string, offsetSeconds: number) => Promise<void>;
   renderClipPreview: (clipId: string) => Promise<void>;
   renderClipFinal: (clipId: string, templateId: string) => Promise<void>;
-  // A Set, not a single id — rendering is now queued/serialized entirely on the backend
-  // (render_manager.rs's semaphore), so requesting a render for clip B while clip A is
-  // still rendering is expected and safe; both need their own "rendering" UI state instead
-  // of one clobbering the other.
+
   renderingClipIds: Set<string>;
-  // Bumped on every successful render — the rendered file path is stable
-  // (`{clipId}_{templateId}.mp4` / `{clipId}.mp4`), so a re-render doesn't change the src
-  // string a <video> element uses. Without a cache-buster, the player keeps showing
-  // whatever it already decoded from that URL instead of the freshly rendered bytes,
-  // which made fixes like the caption-alignment render bug look like they hadn't applied.
+
   renderVersion: Record<string, number>;
   updateClipCaption: (clipId: string, caption: string) => Promise<void>;
   updateClipCustomCaption: (clipId: string, caption: string) => Promise<void>;
@@ -121,8 +116,8 @@ interface ProjectStore {
 let clipsProgressUnlisten: (() => void) | null = null;
 let movieProgressUnlisten: (() => void) | null = null;
 
-// Shared by analyzeClips/analyzeMovie — both listen on the same event, filtered by mode,
-// and drive one of the two independent progress trackers.
+const backgroundPreviewAttempted = new Set<string>();
+
 async function runAnalysis(
   projectId: string,
   mode: "clips" | "movie",
@@ -236,17 +231,45 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     try {
       const clips = await invoke<Clip[]>("get_clips", { projectId });
       set({ clips });
+      get().renderAllMissingPreviews(projectId);
     } catch (error) {
       set({ error: String(error) });
+    }
+  },
+
+  renderAllMissingPreviews: (projectId) => {
+    const targets = get().clips.filter(
+      (c) =>
+        c.projectId === projectId &&
+        !c.outputPath &&
+        !c.finalOutputPath &&
+        !backgroundPreviewAttempted.has(c.id)
+    );
+    if (targets.length === 0) return;
+    for (const clip of targets) {
+      backgroundPreviewAttempted.add(clip.id);
+      set({ renderingClipIds: new Set(get().renderingClipIds).add(clip.id) });
+      invoke<string>("render_clip_preview", { clipId: clip.id })
+        .then((outputPath) => {
+          set({
+            clips: get().clips.map((c) => (c.id === clip.id ? { ...c, outputPath, status: "ready" } : c)),
+            renderVersion: { ...get().renderVersion, [clip.id]: (get().renderVersion[clip.id] ?? 0) + 1 },
+          });
+        })
+        .catch(() => {
+
+        })
+        .finally(() => {
+          const next = new Set(get().renderingClipIds);
+          next.delete(clip.id);
+          set({ renderingClipIds: next });
+        });
     }
   },
 
   analyzeClips: (projectId) => runAnalysis(projectId, "clips", "analyze_clips", "clipsAnalysisProgress", set, get),
   analyzeMovie: (projectId) => runAnalysis(projectId, "movie", "analyze_movie", "movieAnalysisProgress", set, get),
 
-  // Interrupts the in-flight AI call; the still-pending analyzeClips/analyzeMovie promise
-  // above rejects shortly after (the Rust command's own error path), so its existing
-  // catch/finally clears progress state and status — nothing more to do here.
   cancelAnalysis: async (projectId, mode) => {
     try {
       await invoke("cancel_analysis", { projectId, mode });
@@ -296,11 +319,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
   renderClipPreview: async (clipId) => {
     set({ error: null, renderingClipIds: new Set(get().renderingClipIds).add(clipId) });
     try {
-      // This invoke can sit queued behind another clip's render (backend semaphore in
-      // render_manager.rs) before it even starts — that's the point, not a bug: it lets
-      // several renders be requested back to back and just processes them one at a time
-      // instead of racing multiple ffmpeg encodes, while every other action in the app
-      // (including starting yet another render) keeps working immediately.
+
       const outputPath = await invoke<string>("render_clip_preview", { clipId });
       set({
         clips: get().clips.map((c) =>
@@ -345,8 +364,6 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     });
   },
 
-  // Kept fully separate from updateClipCaption/aiCaption — this is the user's own writing,
-  // never overwritten by Generate with AI.
   updateClipCustomCaption: async (clipId, caption) => {
     await invoke("update_clip_custom_caption", { clipId, caption });
     set({
@@ -371,9 +388,6 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     }
   },
 
-  // Backend already serializes every caption request per project (one shared AI Engine tab
-  // — see CaptionLocks in commands/project.rs), so this is safe to fire even if a per-clip
-  // generate is somehow also in flight; it'll just queue behind it.
   generateMissingCaptions: async (projectId, kind) => {
     set({ error: null, generatingCaptionsForProject: projectId });
     try {
@@ -386,10 +400,6 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     }
   },
 
-  // Batch review pass: sends every already-generated caption in the project to a dedicated
-  // review chat tab (with the transcript for context) and asks it to rewrite whichever ones
-  // aren't chaotic/TikTok-slang enough, are too long/formal, aren't algorithm-optimized, or
-  // repeat another clip's caption — see `refine_captions` in commands/project.rs.
   refineCaptions: async (projectId, kind) => {
     set({ error: null, refiningCaptionsForProject: projectId });
     try {
@@ -402,9 +412,6 @@ export const useProjectStore = create<ProjectStore>((set, get) => ({
     }
   },
 
-  // Asks the AI Engine for hashtags actually trending right now (excluding evergreen ones
-  // like #fyp) and saves them on the project — every clip queued afterward picks them up
-  // automatically in its TikTok title (see build_tiktok_title in queue_manager.rs).
   fetchTrendingHashtags: async (projectId) => {
     set({ error: null, fetchingTrendingHashtags: true });
     try {

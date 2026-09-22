@@ -1,7 +1,4 @@
-// SQLite schema (SPEC.md section 3), applied idempotently on startup. A single
-// `CREATE TABLE IF NOT EXISTS` pass is enough for now since there's only one schema
-// version to reach — swap for a real migration framework once the schema needs to evolve
-// across shipped versions.
+
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -102,7 +99,6 @@ CREATE TABLE IF NOT EXISTS render_queue (
 );
 "#;
 
-/// `<app data dir>/clipflow.db` — created if missing.
 pub fn db_path(app_data_dir: &PathBuf) -> PathBuf {
     app_data_dir.join("clipflow.db")
 }
@@ -112,35 +108,27 @@ pub fn open(app_data_dir: &PathBuf) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path(app_data_dir))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(SCHEMA)?;
-    // `ADD COLUMN IF NOT EXISTS` isn't supported by the bundled SQLite version here, so
-    // idempotency is done by ignoring the "duplicate column" failure on repeat runs —
-    // added after the initial schema for Phase 4's template-based final render
-    // (NEXT_PHASE.md). No real migration framework yet; fine for a single added column.
+
     match conn.execute_batch("ALTER TABLE clips ADD COLUMN final_output_path TEXT;") {
         Ok(()) => {}
         Err(e) if e.to_string().contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
-    // Added for the queue manager (SPEC section 8) to report per-item upload percentage.
+
     match conn.execute_batch("ALTER TABLE upload_queue ADD COLUMN progress INTEGER NOT NULL DEFAULT 0;") {
         Ok(()) => {}
         Err(e) if e.to_string().contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
-    // Any row left "uploading" from a previous crash/close is stale — requeue it so the
-    // manager picks it back up instead of leaving it stuck forever.
+
     conn.execute_batch("UPDATE upload_queue SET status = 'queued' WHERE status = 'uploading';")?;
-    // Full Movie mode (Part 1, Part 2, ...) coexists with the original best-highlights
-    // mode — 'kind' distinguishes rows so both share the same clips table (and all its
-    // render/preview/upload-queue/template machinery) instead of duplicating it.
+
     match conn.execute_batch("ALTER TABLE clips ADD COLUMN kind TEXT NOT NULL DEFAULT 'clip';") {
         Ok(()) => {}
         Err(e) if e.to_string().contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
-    // clips_status/movie_status replace the single `status` column for gating each mode's
-    // Analyze UI independently — `status` is left in place (still written by analyze_clips)
-    // since dropping columns isn't supported without a real migration framework.
+
     match conn.execute_batch("ALTER TABLE projects ADD COLUMN clips_status TEXT NOT NULL DEFAULT 'idle';") {
         Ok(()) => {}
         Err(e) if e.to_string().contains("duplicate column name") => {}
@@ -151,82 +139,71 @@ pub fn open(app_data_dir: &PathBuf) -> rusqlite::Result<Connection> {
         Err(e) if e.to_string().contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
-    // Backfill clips_status for projects analyzed before this column existed, so their
-    // already-generated clips don't get hidden behind an "Analyze Clips" prompt.
+
     conn.execute_batch(
         "UPDATE projects SET clips_status = 'ready' WHERE clips_status = 'idle'
          AND EXISTS (SELECT 1 FROM clips WHERE clips.project_id = projects.id AND clips.kind = 'clip');",
     )?;
-    // JSON-encoded array of hashtags the Caption Generator extracted separately from the
-    // caption text (SPEC intent: keep captions hashtag-free, prepare hashtags for a future
-    // auto-upload flow instead).
+
     match conn.execute_batch("ALTER TABLE clips ADD COLUMN hashtags TEXT NOT NULL DEFAULT '[]';") {
         Ok(()) => {}
         Err(e) if e.to_string().contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
-    // Set for YouTube-imported projects (youtube_import_project) to the video's own
-    // thumbnail — lets the project switcher show the actual YouTube thumbnail instead of an
-    // ffmpeg-extracted frame, which for a downloaded video is often a black/blank moment.
+
     match conn.execute_batch("ALTER TABLE projects ADD COLUMN source_thumbnail_url TEXT;") {
         Ok(()) => {}
         Err(e) if e.to_string().contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
-    // A user-written caption, kept fully separate from `ai_caption` — generating (or
-    // re-generating) the AI caption must never clobber something the user typed themselves,
-    // and vice versa. Neither is baked into a render unless a template's caption/caption2
-    // text actually references `{ai_caption}` / `{custom_caption}`.
+
     match conn.execute_batch("ALTER TABLE clips ADD COLUMN custom_caption TEXT;") {
         Ok(()) => {}
         Err(e) if e.to_string().contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
-    // JSON-encoded array of currently-trending hashtags fetched on demand (via the
-    // "Trending hashtags" AI call) for this project — reused across every clip's TikTok
-    // title instead of re-fetching per clip, since "trending right now" doesn't change
-    // meaningfully between clips uploaded minutes apart within the same session.
+
     match conn.execute_batch("ALTER TABLE projects ADD COLUMN trending_hashtags TEXT NOT NULL DEFAULT '[]';") {
         Ok(()) => {}
         Err(e) if e.to_string().contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
-    // Unlike upload_queue, render_queue has no independent background worker — a
-    // 'queued'/'rendering' row only ever progresses because the original
-    // render_clip_preview/render_clip_final call that inserted it is still awaiting inside
-    // this same process (render_manager.rs). Any such row still present when the app starts
-    // up must be left over from a previous process that was closed or crashed mid-render —
-    // nothing will ever pick it back up. Resetting it to 'queued' (as if requeuing it, the
-    // upload_queue pattern) was actively wrong here: the row just sat there forever with no
-    // real work behind it, keeping the render-queue indicator spinning indefinitely. Mark it
-    // failed instead so it clears; re-selecting/re-rendering the clip starts a fresh row.
+
     conn.execute_batch(
         "UPDATE render_queue SET status = 'failed', error_message = 'Interrupted — app was closed or restarted while this was rendering', completed_at = datetime('now') WHERE status IN ('queued', 'rendering');",
     )?;
-    // Manual correction for a transcript whose timestamps don't line up with the actual
-    // movie file (wrong export, extra intro/logo not in the transcript, etc.) — applied to
-    // every transcript entry's start/end before it's used for subtitle cues, so the
-    // in-app preview and the final render both shift in lockstep. See transcript_sync.rs.
+
     match conn.execute_batch("ALTER TABLE projects ADD COLUMN transcript_offset_seconds REAL NOT NULL DEFAULT 0;") {
         Ok(()) => {}
         Err(e) if e.to_string().contains("duplicate column name") => {}
         Err(e) => return Err(e),
     }
+    match conn.execute_batch("ALTER TABLE upload_queue ADD COLUMN finished_at TEXT;") {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("duplicate column name") => {}
+        Err(e) => return Err(e),
+    }
+
+    match conn.execute_batch("ALTER TABLE upload_queue ADD COLUMN required_template_id TEXT;") {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("duplicate column name") => {}
+        Err(e) => return Err(e),
+    }
+
+    conn.execute_batch(
+        "UPDATE upload_queue SET finished_at = completed_at WHERE status = 'completed' AND finished_at IS NULL;",
+    )?;
     seed_default_template(&conn)?;
     Ok(conn)
 }
 
-// TikTok-safe starter template so a fresh install has something to render with instead of
-// an empty "No templates yet" state. 1080x1920 (9:16) filled (no letterboxing), caption
-// kept clear of TikTok's bottom UI (comment tray sits in roughly the bottom 15%).
 fn seed_default_template(conn: &Connection) -> rusqlite::Result<()> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM templates", [], |row| row.get(0))?;
     if count > 0 {
         return Ok(());
     }
     let id = uuid::Uuid::new_v4().to_string();
-    // r##"..."## (double #) since the JSON contains literal `"#` sequences (hex colors)
-    // that would otherwise prematurely terminate a single-# raw string.
+
     let config_json = r##"{
         "version": 2,
         "platform": "tiktok",

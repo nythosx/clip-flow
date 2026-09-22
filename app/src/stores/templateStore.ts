@@ -21,10 +21,6 @@ export interface CaptionOverlayConfig {
   alignment: Alignment;
 }
 
-// Same shape as CaptionOverlayConfig minus `text` (and `anchor`, which caption never actually
-// applies — see ffmpeg.rs's render_final doc comment) — the text for each on-screen instant
-// comes from the project's transcript at render time, one line at a time as playback reaches
-// it. Only styling/position is authored here, exactly like dragging the caption box.
 export interface SubtitleOverlayConfig {
   enabled: boolean;
   fontFamily: string;
@@ -49,8 +45,7 @@ export interface TemplateConfig {
     rotation: 0 | 90 | 180 | 270;
     scaling: Scaling;
     crop: { x: number; y: number };
-    // 0-1: how far to blend from "fit" (0, fully visible, letterboxed) to "fill" (1, no
-    // letterbox, max side crop) — only meaningful when scaling is "zoom".
+
     zoom: number;
   };
   watermark: {
@@ -62,11 +57,9 @@ export interface TemplateConfig {
     opacity: number;
   };
   caption: CaptionOverlayConfig;
-  // Independent second caption overlay — e.g. caption is a manually-typed or
-  // {ai_caption} hook, caption2 an auto "{part_number}"-based label for Full Movie mode.
-  // Both have their own enabled flag/text/position/styling.
+
   caption2: CaptionOverlayConfig;
-  // Transcript-synced subtitle track — see SubtitleOverlayConfig's doc comment.
+
   subtitle: SubtitleOverlayConfig;
   encoding: {
     codec: "h264" | "h265";
@@ -189,9 +182,7 @@ export const useTemplateStore = create<TemplateStore>((set, get) => ({
     try {
       const template = await invoke<Template>("get_template", { id });
       const parsed = JSON.parse(template.configJson) as Partial<TemplateConfig>;
-      // Templates saved before caption2 (or fontWeight) existed are missing those fields
-      // entirely — deep-merge caption/caption2 onto the defaults so older templates don't
-      // end up with undefined values when edited.
+
       const defaults = defaultTemplateConfig(parsed.platform ?? "tiktok");
       const canvasState: TemplateConfig = {
         ...defaults,

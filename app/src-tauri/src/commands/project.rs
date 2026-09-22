@@ -9,9 +9,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// Tracks the currently in-flight AI requestId for each `"{project_id}:{mode}"` pair so
-/// `cancel_analysis` can find and interrupt it. Entries only exist while an AI call for
-/// that project+mode is actually awaiting a response.
 #[derive(Default)]
 pub struct AnalysisRegistry(pub Mutex<HashMap<String, String>>);
 
@@ -19,14 +16,6 @@ fn registry_key(project_id: &str, mode: &str) -> String {
     format!("{project_id}:{mode}")
 }
 
-/// Serializes caption generation per project — every clip's "Generate with AI" (and the
-/// batch `generate_missing_captions`) shares one AI Engine browser tab per project
-/// (`sessionKey = "{project_id}:caption"`, see `generate_and_save_caption`'s doc comment).
-/// Firing two of those concurrently (e.g. clicking Generate on clip B before clip A's
-/// request finished) let the AI Engine's single-tab orchestration cross the wires and hand
-/// clip B the response actually meant for clip A. Holding this lock for the full
-/// request+save of each caption call makes that overlap structurally impossible instead of
-/// relying on the external AI Engine to get tab/request correlation right.
 #[derive(Default)]
 pub struct CaptionLocks(Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
 
@@ -37,11 +26,17 @@ impl CaptionLocks {
     }
 }
 
-/// Wraps an AI call with cancellation bookkeeping: generates the requestId up front,
-/// registers it under `key` for the duration of the call, and always deregisters it after
-/// (success, failure, or — if cancelled — the "Cancelled by user" error `AiClient::cancel_request`
-/// injects).
-async fn call_ai_tracked(
+const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+const STALL_PREFIX: &str = "STALLED:";
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+async fn call_ai_tracked_once(
     app: &AppHandle,
     ai: &Arc<AiClient>,
     registry: &AnalysisRegistry,
@@ -57,16 +52,56 @@ async fn call_ai_tracked(
     let app_for_status = app.clone();
     let project_id_owned = project_id.to_string();
     let mode_owned = mode.to_string();
+    let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(now_ms()));
+    let last_activity_for_task = last_activity.clone();
     let status_task = tauri::async_runtime::spawn(async move {
         while let Some(message) = status_rx.recv().await {
+            last_activity_for_task.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
             emit_detail(&app_for_status, &project_id_owned, &mode_owned, &message);
         }
     });
 
-    let result = ai.call_ai_default_timeout(payload).await;
+    let call_future = ai.call_ai_default_timeout(payload);
+    tokio::pin!(call_future);
+    let result = loop {
+        tokio::select! {
+            res = &mut call_future => break res,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
+                let stalled_for = now_ms() - last_activity.load(std::sync::atomic::Ordering::Relaxed);
+                if stalled_for >= STALL_TIMEOUT.as_millis() as i64 {
+                    ai.cancel_request(&request_id).await;
+                    break Err(format!(
+                        "{STALL_PREFIX}no response from the AI Engine tab for {}s — it may have been paused by Chrome",
+                        STALL_TIMEOUT.as_secs()
+                    ));
+                }
+            }
+        }
+    };
+
     status_task.abort();
     registry.0.lock().map_err(|e| e.to_string())?.remove(key);
     result
+}
+
+async fn call_ai_tracked(
+    app: &AppHandle,
+    ai: &Arc<AiClient>,
+    registry: &AnalysisRegistry,
+    key: &str,
+    payload: Value,
+) -> Result<Value, String> {
+    match call_ai_tracked_once(app, ai, registry, key, payload.clone()).await {
+        Err(e) if e.starts_with(STALL_PREFIX) => {
+            let (project_id, mode) = key.split_once(':').unwrap_or((key, ""));
+            emit_detail(app, project_id, mode, "AI Engine seemed stuck — retrying automatically…");
+            call_ai_tracked_once(app, ai, registry, key, payload)
+                .await
+                .map_err(|e| e.trim_start_matches(STALL_PREFIX).to_string())
+        }
+        Err(e) => Err(e.trim_start_matches(STALL_PREFIX).to_string()),
+        Ok(v) => Ok(v),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -94,8 +129,6 @@ pub struct Project {
     pub updated_at: String,
 }
 
-// Subquery-based column list (instead of `SELECT *`) so every project row carries its
-// clip/part counts for the sidebar project switcher without an N+1 query per project.
 const PROJECT_SELECT: &str = "
     SELECT p.*,
         (SELECT COUNT(*) FROM clips WHERE clips.project_id = p.id AND clips.kind = 'clip') AS clips_count,
@@ -126,7 +159,7 @@ pub struct Clip {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectAnalysisProgress {
     pub project_id: String,
-    pub mode: String, // "clips" | "movie"
+    pub mode: String,
     pub stage: String,
     pub progress: f64,
     pub detail: Option<String>,
@@ -250,9 +283,6 @@ pub async fn get_clips(db: State<'_, Db>, project_id: String) -> Result<Vec<Clip
     Ok(rows)
 }
 
-/// Sets a project's display thumbnail to an external image URL — used right after
-/// `youtube_import_project` creates the project, so the sidebar switcher shows the video's
-/// actual YouTube thumbnail rather than an ffmpeg-extracted frame of the downloaded file.
 #[tauri::command]
 pub async fn set_project_thumbnail(db: State<'_, Db>, id: String, thumbnail_url: String) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -277,27 +307,16 @@ pub async fn update_project_name(db: State<'_, Db>, id: String, name: String) ->
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptSyncStatus {
     pub movie_duration_seconds: f64,
-    // Transcript's own [first entry start, last entry end] span, BEFORE the stored offset
-    // is applied — this is what a mismatch check compares against the real movie duration.
+
     pub transcript_start_seconds: f64,
     pub transcript_end_seconds: f64,
     pub offset_seconds: f64,
-    // True when the transcript's span is off from the movie's real duration by more than
-    // the tolerance below, OR it starts more than the tolerance into the movie — either
-    // shape is a strong sign the transcript wasn't exported from this exact video file.
+
     pub mismatch: bool,
 }
 
-// How far off (in seconds) a transcript's span/start can be from the movie's real duration
-// before it's flagged — generous enough to tolerate a transcript that simply omits trailing
-// credits or a leading logo card, but still catches "wrong file" / "way out of sync" cases.
 const SYNC_TOLERANCE_SECONDS: f64 = 45.0;
 
-/// Compares a project's transcript timestamps against its movie file's actual duration
-/// (probed fresh via ffmpeg, not the `source_duration_seconds` column — that field is
-/// derived FROM the transcript itself during Analyze, so it can't catch the transcript
-/// being wrong in the first place). Surfaces a warning banner in the project view instead
-/// of the mismatch only becoming visible once you notice captions drifting from the audio.
 #[tauri::command]
 pub async fn get_transcript_sync_status(db: State<'_, Db>, project_id: String) -> Result<TranscriptSyncStatus, String> {
     let (movie_path, transcript_path, offset_seconds) = {
@@ -329,11 +348,6 @@ pub async fn get_transcript_sync_status(db: State<'_, Db>, project_id: String) -
     })
 }
 
-/// Manual fix for a mismatched transcript — shifts every parsed timestamp by a constant
-/// number of seconds wherever the transcript is used for the subtitle overlay (both the
-/// in-app live preview and the final ffmpeg render). Does NOT retroactively move already-cut
-/// clip start/end boundaries or re-run AI analysis — those were decided from the transcript
-/// as it stood at Analyze time; re-syncing subtitles doesn't require redoing that.
 #[tauri::command]
 pub async fn set_transcript_offset(db: State<'_, Db>, project_id: String, offset_seconds: f64) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -369,18 +383,13 @@ pub async fn delete_project(app: AppHandle, db: State<'_, Db>, id: String) -> Re
         (movie_path, transcript_path, clip_ids)
     };
 
-    // Cascading FKs already dropped the DB rows (clips, ai_cache, upload_queue,
-    // render_queue) — this removes the actual bytes on disk that nothing references any
-    // more, so storage doesn't quietly accumulate every deleted project's
-    // renders/thumbnails/downloads forever.
     if let Ok(app_data_dir) = app.path().app_data_dir() {
         let _ = std::fs::remove_file(app_data_dir.join("thumbnails").join(format!("{id}.jpg")));
 
         for clip_id in &clip_ids {
             let _ = std::fs::remove_file(app_data_dir.join("thumbnails").join(format!("{clip_id}.jpg")));
             let _ = std::fs::remove_file(app_data_dir.join("renders").join(format!("{clip_id}.mp4")));
-            // Final renders are named "<clip_id>_<template_id>.mp4" — the template id isn't
-            // known here, so sweep the directory for anything with this clip's prefix.
+
             if let Ok(entries) = std::fs::read_dir(app_data_dir.join("renders").join("final")) {
                 for entry in entries.flatten() {
                     if entry.file_name().to_string_lossy().starts_with(&format!("{clip_id}_")) {
@@ -390,10 +399,6 @@ pub async fn delete_project(app: AppHandle, db: State<'_, Db>, id: String) -> Re
             }
         }
 
-        // Only remove the source video/transcript when they're a copy this app made itself
-        // (e.g. a YouTube import under youtube_downloads) — never a user-picked file living
-        // elsewhere on disk, which this project doesn't own and which the user may still
-        // want or reuse in another project.
         let youtube_downloads_dir = app_data_dir.join("youtube_downloads");
         for path_str in [Some(movie_path), transcript_path].into_iter().flatten() {
             let path = std::path::PathBuf::from(&path_str);
@@ -417,8 +422,6 @@ pub async fn update_clip_caption(db: State<'_, Db>, clip_id: String, caption: St
     Ok(())
 }
 
-/// Separate from `update_clip_caption` on purpose — this is the user's own hand-written
-/// caption, never touched by "Generate with AI" (which only ever writes `ai_caption`).
 #[tauri::command]
 pub async fn update_clip_custom_caption(db: State<'_, Db>, clip_id: String, caption: String) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -456,8 +459,6 @@ fn emit_detail(app: &AppHandle, project_id: &str, mode: &str, message: &str) {
     );
 }
 
-// `column` is always one of the two hardcoded literals below (never caller-controlled),
-// so interpolating it into the SQL string here doesn't open an injection path.
 fn set_mode_status(conn: &rusqlite::Connection, project_id: &str, column: &str, status: &str) -> Result<(), String> {
     conn.execute(
         &format!("UPDATE projects SET {column} = ?1, updated_at = datetime('now') WHERE id = ?2"),
@@ -467,9 +468,6 @@ fn set_mode_status(conn: &rusqlite::Connection, project_id: &str, column: &str, 
     Ok(())
 }
 
-/// Runs Smart Trimmer then Clip Finder against the AI Engine (SPEC.md section 6.A/B) and
-/// persists the resulting best-highlights clips (`kind = 'clip'`). Caption Generator is a
-/// separate per-clip command (`generate_clip_caption`), not called here.
 #[tauri::command]
 pub async fn analyze_clips(
     app: AppHandle,
@@ -508,7 +506,6 @@ pub async fn analyze_clips(
     }
     let total_duration = entries.iter().map(|e| e.end).fold(0.0_f64, f64::max);
 
-    // SPEC.md section 6.A: "excerpt showing first 5 minutes and last 5 minutes".
     let excerpt: String = entries
         .iter()
         .filter(|e| e.start <= 300.0 || e.start >= total_duration - 300.0)
@@ -557,7 +554,6 @@ pub async fn analyze_clips(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Best-effort derivation of the kept range from what got removed at the very start/end.
     let trimmed_start = removed.iter().find(|(s, _)| *s <= 0.5).map(|(_, e)| *e);
     let trimmed_end = removed
         .iter()
@@ -627,10 +623,6 @@ pub async fn analyze_clips(
     Ok(())
 }
 
-/// Splits the whole (trimmed) runtime into sequential Part 1, Part 2, ... chunks
-/// (`kind = 'part'`) at AI-detected natural scene/topic breaks, instead of picking best
-/// moments. Coexists with `analyze_clips` — both write into the same `clips` table so
-/// preview/render/template/upload-queue all work on a Part exactly like a Clip.
 #[tauri::command]
 pub async fn analyze_movie(
     app: AppHandle,
@@ -676,8 +668,6 @@ pub async fn analyze_movie(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Own session key (not shared with analyze_clips's trim session) so the two modes'
-    // AI conversations don't contend or cross-talk.
     emit_progress(&app, &id, "movie", "smart_trimmer", 0.2);
     let trim_result = call_ai_tracked(
         &app,
@@ -787,11 +777,6 @@ pub async fn analyze_movie(
     Ok(())
 }
 
-/// Interrupts an in-flight `analyze_clips`/`analyze_movie` call for this project+mode.
-/// The awaiting call gets an immediate "Cancelled by user" error, which flows through that
-/// command's existing error handling (marks `clips_status`/`movie_status` = 'error') —
-/// there's no separate "cancelled" state to keep in sync. A no-op (not an error) if nothing
-/// was actually in flight, since that's a harmless race (e.g. it just finished on its own).
 #[tauri::command]
 pub async fn cancel_analysis(
     ai: State<'_, Arc<AiClient>>,
@@ -813,13 +798,6 @@ pub struct GeneratedCaption {
     pub hashtags: Vec<String>,
 }
 
-/// Auto-generates captions for every clip/part in a project still missing one, right after
-/// analysis finishes — so captions show up without a separate manual step, while staying
-/// editable afterward (`update_clip_caption`/regenerable via `generate_clip_caption`).
-/// Best-effort: one clip's caption failing doesn't fail the whole analyze command (the
-/// clips/parts themselves are already saved and usable) — it's just skipped, still
-/// generatable manually later. A cancellation, though, stops the whole backfill rather than
-/// skipping to the next clip, matching what hitting Stop should mean.
 async fn backfill_missing_captions(
     app: &AppHandle,
     db: &State<'_, Db>,
@@ -855,18 +833,6 @@ async fn backfill_missing_captions(
     }
 }
 
-/// Calls the AI Engine's Caption Generator (SPEC.md section 6.C) for one clip and persists
-/// the result — shared by the standalone `generate_clip_caption` command and the automatic
-/// missing-caption backfill in `analyze_clips`/`analyze_movie`.
-///
-/// `sessionKey` is `"{project_id}:caption"` — one shared chat tab per *project*, not one
-/// per clip. Generating captions for many clips used to open a brand-new browser tab per
-/// clip (via a `{clip_id}:caption` sessionKey), and enough tabs piled up quickly enough to
-/// make a later call fail; content.js then resolved with `{error}` instead of throwing,
-/// which orchestrator.js used to hand back as `undefined` text, surfacing far downstream as
-/// "Cannot read properties of undefined (reading 'trim')". Reusing one tab per project fixes
-/// the pileup at the root, and the `res.error` checks added to orchestrator.js turn any
-/// future failure into a real, readable error instead of that crash.
 async fn generate_and_save_caption(
     app: &AppHandle,
     ai: &Arc<AiClient>,
@@ -877,9 +843,7 @@ async fn generate_and_save_caption(
     mode: &str,
     clip_id: &str,
 ) -> Result<GeneratedCaption, String> {
-    // Held for this whole request+save — see CaptionLocks's doc comment for why (the AI
-    // Engine's single shared browser tab per project can't safely serve two caption
-    // requests at once).
+
     let lock = caption_locks.get(project_id);
     let _guard = lock.lock().await;
 
@@ -932,8 +896,6 @@ async fn generate_and_save_caption(
     Ok(GeneratedCaption { caption, hashtags })
 }
 
-/// Calls the AI Engine's Caption Generator for a single clip and persists the result —
-/// the manual "Generate with AI" button's command.
 #[tauri::command]
 pub async fn generate_clip_caption(
     app: AppHandle,
@@ -951,11 +913,6 @@ pub async fn generate_clip_caption(
     generate_and_save_caption(&app, &ai, &db, &registry, &caption_locks, &project_id, "caption", &clip_id).await
 }
 
-/// "Generate all missing captions" button's command — same per-clip work
-/// `generate_clip_caption` does, just looped over every clip/part in `kind` that doesn't
-/// have an AI caption yet, one at a time (the shared-tab serialization in
-/// `generate_and_save_caption` would force that anyway, but doing it here means the
-/// frontend gets one command call instead of firing N concurrent ones that'd just queue).
 #[tauri::command]
 pub async fn generate_missing_captions(
     app: AppHandle,
@@ -971,7 +928,6 @@ pub async fn generate_missing_captions(
     Ok(())
 }
 
-/// One clip's caption as sent to/received from the caption-refine batch review.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefinedCaption {
@@ -979,14 +935,6 @@ pub struct RefinedCaption {
     pub caption: String,
 }
 
-/// Batch-reviews every already-generated caption in a project against the same shared
-/// context (each other + the transcript) instead of the one-clip-in-isolation view
-/// `generate_and_save_caption` has — so it can catch and fix problems that only show up
-/// across the set: near-duplicate hooks between clips, captions that read too formal/long,
-/// or ones that aren't actually algorithm-optimized. Runs on a dedicated
-/// `"{project_id}:caption-refine"` chat tab, deliberately separate from the per-clip
-/// `"{project_id}:caption"` session, so the review sees the captions as a finished batch
-/// rather than continuing the same conversation that generated them one at a time.
 #[tauri::command]
 pub async fn refine_captions(
     app: AppHandle,
@@ -1066,10 +1014,6 @@ pub async fn refine_captions(
     Ok(refined)
 }
 
-/// Asks the AI Engine for hashtags actually trending right now (explicitly excluding
-/// evergreen tags like #fyp that carry no real algorithmic signal) and saves them on the
-/// project, so every clip queued from it picks them up (`build_tiktok_title` in
-/// `queue_manager.rs`) without re-fetching per clip.
 #[tauri::command]
 pub async fn fetch_trending_hashtags(
     app: AppHandle,

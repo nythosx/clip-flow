@@ -35,9 +35,6 @@ export default function Layout() {
     initRenderQueueListeners();
     fetchRenderQueue();
 
-    // Keep the splash animation on screen for at least this long so it doesn't just flash
-    // by on a fast machine — the main window (hidden until now, see tauri.conf.json) swaps
-    // in once this fires.
     const timer = setTimeout(() => {
       invoke("close_splashscreen").catch(() => {});
     }, 1200);
@@ -72,8 +69,7 @@ export default function Layout() {
           </div>
         )}
 
-        {/* Chrome-style downloads tray: lives outside the route list since it's a toggled
-            overlay panel, not a page — but styled to match the other nav buttons. */}
+        { }
         <button
           onClick={() => setShowDownloads((v) => !v)}
           className={`relative w-[60px] flex flex-col items-center gap-1 py-2.5 rounded-lg transition-colors ${

@@ -18,9 +18,14 @@ export interface QueueItem {
   clipFinalOutputPath: string | null;
   scheduledAt: string | null;
   completedAt: string | null;
+  finishedAt: string | null;
   createdAt: string;
   title: string;
   hashtags: string[];
+  kind: string;
+  partNumber: number;
+  clipRendering: boolean;
+  blockReason: string | null;
 }
 
 interface UploadProgressEvent {
@@ -38,17 +43,18 @@ interface QueueStore {
   initListeners: () => void;
   fetchQueue: () => Promise<void>;
   addToQueue: (clipId: string, accountIds: string[]) => Promise<void>;
+  queueAndRender: (clipId: string, accountIds: string[], templateId: string | null) => Promise<void>;
   pauseAll: () => Promise<void>;
   resumeAll: () => Promise<void>;
   retryItem: (id: string) => Promise<void>;
   removeItem: (id: string) => Promise<void>;
+  removeItems: (ids: string[]) => Promise<void>;
   clearCompleted: () => Promise<void>;
+  clearFailed: () => Promise<void>;
 }
 
 let listenersInitialized = false;
-// Tracks whether a batch of uploads is actually "in flight" so the uploadsDone voice line
-// fires once when the queue drains, not on every individual item (that's what the per-item
-// success/error SFX below is for) and not on app startup when the queue simply starts empty.
+
 let hadActiveUploads = false;
 
 export const useQueueStore = create<QueueStore>((set, get) => ({
@@ -67,9 +73,6 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
       const nextItems = get().items.map((item) => (item.id === id ? { ...item, progress, status } : item));
       set({ items: nextItems });
 
-      // Per-item SFX — only on the transition into a terminal state, not on every progress
-      // tick (progress updates keep the same "uploading" status) and not on a rate-limit
-      // reschedule (that sets status back to "queued", not "failed").
       if (status === "completed" && previousStatus !== "completed") playSfx("success");
       if (status === "failed" && previousStatus !== "failed") playSfx("error");
 
@@ -82,6 +85,13 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     });
     listen("queue_paused", () => set({ isPaused: true }));
     listen("queue_resumed", () => set({ isPaused: false }));
+
+    listen("render_queue_update", async () => {
+      try {
+        const items = await invoke<QueueItem[]>("get_queue");
+        set({ items });
+      } catch {}
+    });
   },
 
   fetchQueue: async () => {
@@ -96,6 +106,11 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
 
   addToQueue: async (clipId, accountIds) => {
     await invoke("add_to_queue", { clipId, accountIds });
+    await get().fetchQueue();
+  },
+
+  queueAndRender: async (clipId, accountIds, templateId) => {
+    await invoke("queue_and_render", { clipId, accountIds, templateId });
     await get().fetchQueue();
   },
 
@@ -119,8 +134,19 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     set({ items: get().items.filter((item) => item.id !== id) });
   },
 
+  removeItems: async (ids) => {
+    await Promise.all(ids.map((id) => invoke("remove_queue_item", { itemId: id })));
+    const idSet = new Set(ids);
+    set({ items: get().items.filter((item) => !idSet.has(item.id)) });
+  },
+
   clearCompleted: async () => {
     await invoke("clear_completed_queue");
     set({ items: get().items.filter((item) => item.status !== "completed") });
+  },
+
+  clearFailed: async () => {
+    await invoke("clear_failed_queue");
+    set({ items: get().items.filter((item) => item.status !== "failed") });
   },
 }));

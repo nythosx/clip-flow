@@ -51,24 +51,19 @@ export const useAccountStore = create<AccountStore>((set, get) => ({
   },
 
   connectTikTok: async () => {
-    // Opens the system browser for TikTok's OAuth consent screen and blocks until the
-    // loopback callback listener catches the redirect and the token exchange finishes —
-    // see commands/account.rs::connect_tiktok_account.
+
     const account = await invoke<Account>("connect_tiktok_account");
     set({ accounts: [account, ...get().accounts.filter((a) => a.id !== account.id)] });
   },
 
   connectYouTube: async () => {
-    // Same loopback OAuth pattern as connectTikTok, against Google's installed-app flow —
-    // see commands/youtube.rs::connect_youtube_account.
+
     const account = await invoke<Account>("connect_youtube_account");
     set({ accounts: [account, ...get().accounts.filter((a) => a.id !== account.id)] });
   },
 
   connectFacebook: async () => {
-    // One Facebook login connects the personal profile AND every Page the user manages in
-    // a single pass — see commands/facebook.rs::connect_facebook_account — so this can
-    // return multiple accounts from one browser round-trip, unlike TikTok/YouTube.
+
     const newAccounts = await invoke<Account[]>("connect_facebook_account");
     const newIds = new Set(newAccounts.map((a) => a.id));
     set({ accounts: [...newAccounts, ...get().accounts.filter((a) => !newIds.has(a.id))] });

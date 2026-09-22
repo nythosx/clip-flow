@@ -1,16 +1,10 @@
-// TikTok Content Posting API + OAuth (Login Kit) client. Replaces the queue processor's
-// old simulated-progress stub (queue_manager.rs) with real calls, per SPEC.md section 12
-// superseded — ADB-emulator automation was the original plan but is fragile (breaks on any
-// TikTok UI change) and borderline against ToS; the official API is the reliable path and
-// is what TikTok's App Review process actually verifies.
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 const AUTH_BASE: &str = "https://www.tiktok.com/v2/auth/authorize/";
 const API_BASE: &str = "https://open.tiktokapis.com/v2";
-// Fixed (not ephemeral) so it matches the redirect URI registered once in the Developer
-// Portal's Platform configuration — this app has no web server, so the OAuth redirect is
-// caught by a temporary loopback listener instead (same pattern as `gh`/`gcloud` CLI auth).
+
 pub const OAUTH_REDIRECT_PORT: u16 = 53682;
 
 pub fn redirect_uri() -> String {
@@ -19,26 +13,12 @@ pub fn redirect_uri() -> String {
 
 pub fn authorize_url(client_key: &str, state: &str, code_challenge: &str) -> String {
     let redirect = urlencoding_encode(&redirect_uri());
-    // `video.publish` (NOT `video.upload`) is what actually authorizes
-    // POST /post/publish/video/init/, the direct-post endpoint this app calls — confirmed
-    // against TikTok's live Content Posting API docs after a real account hit
-    // `scope_not_authorized` on every publish attempt with the old scope list. The doc
-    // comment this replaced ("TikTok has no separate video.publish scope") was simply
-    // wrong; `video.upload` is a distinct scope for the inbox/drafts upload flow this app
-    // doesn't use. TikTok requires PKCE (errCode 10007 "code_challenge" otherwise) —
-    // desktop/public clients can't safely embed a client secret in the authorize step, so
-    // PKCE proves possession of the verifier at token-exchange time instead.
+
     format!(
         "{AUTH_BASE}?client_key={client_key}&response_type=code&scope=user.info.basic,video.publish&redirect_uri={redirect}&state={state}&code_challenge={code_challenge}&code_challenge_method=S256"
     )
 }
 
-/// Generates a PKCE verifier/challenge pair. The verifier is 32 random bytes
-/// base64url-encoded (satisfies RFC 7636's 43-128 char unreserved-charset requirement).
-/// The challenge is NOT what generic RFC 7636 (base64url of the SHA-256 digest) would
-/// produce — TikTok's own Login Kit for Desktop docs specify hex-encoded SHA-256 instead,
-/// confirmed by testing: base64url challenges consistently got "Code verifier or code
-/// challenge is invalid" even though the client-side base64url math checked out correctly.
 pub fn generate_pkce() -> (String, String) {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use sha2::{Digest, Sha256};
@@ -51,14 +31,10 @@ pub fn generate_pkce() -> (String, String) {
     (verifier, challenge)
 }
 
-// Only a handful of characters need escaping for this URL's query values; avoids pulling
-// in a dedicated urlencoding crate for one call site.
 fn urlencoding_encode(s: &str) -> String {
     s.replace(':', "%3A").replace('/', "%2F")
 }
 
-/// Decodes `%XX` percent-escapes in a query-string value. TikTok's authorization code can
-/// contain characters (seen: `*`, `!`) that arrive percent-encoded over the OAuth redirect.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -92,20 +68,14 @@ struct TokenErrorEnvelope {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .unwrap_or_default()
 }
 
-/// `queue_manager::run_tiktok_job`'s error string is checked for this prefix so a 429 gets
-/// automatically rescheduled with backoff instead of dead-ending as a "failed" upload the
-/// user has to notice and retry by hand — see `rate_limit_error` below and
-/// `queue_manager::RATE_LIMIT_PREFIX`'s doc comment for the wire format.
 pub const RATE_LIMIT_PREFIX: &str = "RATE_LIMITED:";
 
-/// Builds a `RATE_LIMIT_PREFIX`-tagged error for a 429 response: `RATE_LIMITED:<retry-after
-/// seconds>:<human message>`. Honors TikTok's `Retry-After` header when present (seconds or
-/// an HTTP-date — only the seconds form is parsed; an HTTP-date falls back to the default)
-/// so the backoff matches what TikTok itself is asking for instead of guessing. Consumes
-/// `resp` to read its body for the message.
 async fn rate_limit_error(resp: reqwest::Response, context: &str) -> String {
     const DEFAULT_RETRY_SECONDS: u64 = 60;
     let retry_after = resp
@@ -215,17 +185,6 @@ pub struct UserInfoUser {
     pub video_count: Option<i64>,
 }
 
-/// Fetches user/info fields — restricted to exactly what `user.info.basic` (the only scope
-/// `authorize_url` requests) actually covers: open_id, union_id, avatar_url, display_name.
-///
-/// A prior version of this also requested avatar_url_100/avatar_large_url/bio_description/
-/// profile_deep_link/is_verified/follower_count/following_count/likes_count/video_count on
-/// the (wrong) assumption that TikTok just omits fields a token isn't authorized for.
-/// Confirmed against a live account: it doesn't — requesting ANY field outside the token's
-/// granted scope fails the ENTIRE call with 401 `scope_not_authorized`, not just those
-/// fields. Only re-add the extra fields here if `user.info.profile`/`user.info.stats` are
-/// ever actually added to this app's scope list in the Developer Portal AND `authorize_url`
-/// is updated to request them — adding them here without that will break this call again.
 pub async fn fetch_user_info(access_token: &str) -> Result<UserInfoUser, String> {
     let fields = "open_id,union_id,avatar_url,display_name";
     let resp = client()
@@ -287,30 +246,20 @@ pub struct PublishInit {
     pub upload_url: String,
     pub video_size: u64,
     pub chunk_size: u64,
+    pub total_chunk_count: u64,
 }
 
-// TikTok's Media Transfer Guide: a chunk must be 5-64MB, except the final chunk (which may
-// exceed 64MB, up to 128MB, to absorb the remainder). Videos <= 64MB go up as a single chunk
-// with chunk_size == video_size; anything larger MUST be split into multiple chunks or the
-// init call fails with `invalid_params: chunk size is invalid` — this is what broke uploads
-// for any clip whose rendered file passed 64MB (the first queued clip merely happened to be
-// under that size, which is why only "the rest" failed).
-const SINGLE_CHUNK_LIMIT: u64 = 64 * 1024 * 1024;
-const MAX_CHUNK_SIZE: u64 = 64 * 1024 * 1024;
+const SINGLE_CHUNK_LIMIT: u64 = 64_000_000;
+const CHUNK_SIZE: u64 = 10_000_000;
 
 fn compute_chunking(video_size: u64) -> (u64, u64) {
     if video_size <= SINGLE_CHUNK_LIMIT {
         return (video_size.max(1), 1);
     }
-    let total_chunk_count = video_size.div_ceil(MAX_CHUNK_SIZE);
-    (MAX_CHUNK_SIZE, total_chunk_count)
+    let total_chunk_count = (video_size / CHUNK_SIZE).max(1);
+    (CHUNK_SIZE, total_chunk_count)
 }
 
-/// Starts a Content Posting API publish job. `privacy_level` must be one of the values the
-/// account's TikTok privacy settings actually allow — `SELF_ONLY` is always available, so
-/// that's used until the app is out of Sandbox (public posting requires App Review approval
-/// per TikTok's rules, matching TIKTOK_APP_SETUP context: sandbox posts are only visible to
-/// the developer's own test account).
 pub async fn init_video_publish(
     access_token: &str,
     video_path: &Path,
@@ -343,6 +292,13 @@ pub async fn init_video_publish(
     }
     let body = resp.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
+
+        if body.contains("spam_risk_too_many_posts") {
+            const SPAM_BLOCK_RETRY_SECONDS: u64 = 6 * 60 * 60;
+            return Err(format!(
+                "{RATE_LIMIT_PREFIX}{SPAM_BLOCK_RETRY_SECONDS}:TikTok blocked this post for posting too many times via the API in the last 24 hours: {body}"
+            ));
+        }
         return Err(format!("TikTok publish init failed ({status}): {body}"));
     }
     let envelope: InitPublishEnvelope =
@@ -355,18 +311,21 @@ pub async fn init_video_publish(
         upload_url: envelope.data.upload_url,
         video_size,
         chunk_size,
+        total_chunk_count,
     })
 }
 
-/// Uploads `video_path` to `upload_url` in `chunk_size`-byte pieces (matching whatever
-/// chunk_size was declared to `init_video_publish` — TikTok validates each PUT's
-/// Content-Range against that declared size). The final chunk absorbs any remainder, so it
-/// may be smaller (or, for a video just over 64MB, up to 2x chunk_size) than the others.
-pub async fn upload_video(upload_url: &str, video_path: &Path, video_size: u64, chunk_size: u64) -> Result<(), String> {
+pub async fn upload_video(
+    upload_url: &str,
+    video_path: &Path,
+    video_size: u64,
+    chunk_size: u64,
+    total_chunk_count: u64,
+) -> Result<(), String> {
     let bytes = tokio::fs::read(video_path).await.map_err(|e| e.to_string())?;
     let mut offset: u64 = 0;
-    while offset < video_size {
-        let end = (offset + chunk_size).min(video_size);
+    for i in 0..total_chunk_count {
+        let end = if i == total_chunk_count - 1 { video_size } else { offset + chunk_size };
         let chunk = &bytes[offset as usize..end as usize];
         let resp = client()
             .put(upload_url)
@@ -432,14 +391,6 @@ pub async fn fetch_publish_status(access_token: &str, publish_id: &str) -> Resul
     })
 }
 
-/// Blocks until the OAuth redirect hits `http://127.0.0.1:OAUTH_REDIRECT_PORT/callback`,
-/// then returns the `code`/`state` query params. Serves a minimal static response so the
-/// browser tab shows something before the user switches back to ClipFlow.
-///
-/// Times out after 2 minutes rather than waiting forever — TikTok's own error pages (e.g.
-/// a rejected authorize request) never redirect back here at all, so without a timeout a
-/// failed attempt would hold the port bound indefinitely and break every retry with
-/// "address already in use" until the app is restarted.
 pub async fn await_oauth_callback() -> Result<(String, String), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -456,7 +407,7 @@ pub async fn await_oauth_callback() -> Result<(String, String), String> {
     let mut buf = [0u8; 4096];
     let n = socket.read(&mut buf).await.map_err(|e| e.to_string())?;
     let request = String::from_utf8_lossy(&buf[..n]);
-    // Request line looks like "GET /callback?code=...&state=... HTTP/1.1"
+
     let path_and_query = request
         .lines()
         .next()
@@ -469,10 +420,7 @@ pub async fn await_oauth_callback() -> Result<(String, String), String> {
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
         match (parts.next(), parts.next()) {
-            // TikTok's authorization code contains percent-encoded characters (seen in
-            // practice: %2A for '*', %21 for '!') since it's placed in a URL query string —
-            // must be decoded before use, or the token exchange silently gets a mangled
-            // code that fails validation (surfaces as a generic PKCE mismatch error).
+
             (Some("code"), Some(v)) => code = Some(percent_decode(v)),
             (Some("state"), Some(v)) => state = Some(percent_decode(v)),
             _ => {}

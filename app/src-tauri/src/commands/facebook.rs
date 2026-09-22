@@ -24,10 +24,6 @@ fn row_to_account(row: &rusqlite::Row) -> rusqlite::Result<Account> {
     })
 }
 
-/// Upserts one `accounts` row, keyed on `(platform, accountType, fbId)` inside
-/// `credentials_json` — reconnecting the same Page or the same personal profile updates that
-/// row instead of erroring or duplicating, same guarantee `connect_tiktok_account` and
-/// `connect_youtube_account` already give.
 fn upsert_account(
     conn: &rusqlite::Connection,
     name: &str,
@@ -61,14 +57,6 @@ fn upsert_account(
     }
 }
 
-/// Runs Facebook Login (loopback OAuth, same shape as TikTok/YouTube), then connects BOTH
-/// the personal profile and every Page the user manages in one pass — Facebook's
-/// `/me/accounts` already hands back a Page access token per page from a single user login,
-/// so there's no reason to make the user repeat the browser flow per target. Posting to the
-/// personal profile (`fbId` == the user's own id, `accountType: "user"`) additionally
-/// requires Meta App Review to actually work outside the app's own Development Mode
-/// testers — see facebook_api.rs's `authorize_url` doc comment — but the account is
-/// connected either way so it's ready the moment that's granted.
 #[tauri::command]
 pub async fn connect_facebook_account(
     app: AppHandle,
@@ -143,10 +131,6 @@ pub async fn connect_facebook_account(
     Ok(accounts)
 }
 
-/// Re-fetches full profile/Page detail (about, category, fan/follower counts, link) and
-/// merges it into the stored credentials — the "give me everything you can get" refresh
-/// behind Accounts' Reconnect action for a Facebook row, without re-running the whole OAuth
-/// browser flow.
 #[tauri::command]
 pub async fn refresh_facebook_account(db: tauri::State<'_, Db>, account_id: String) -> Result<Account, String> {
     let (fb_id, account_type, access_token, account_name): (String, String, String, String) = {

@@ -28,9 +28,6 @@ fn close_splashscreen(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // `log::info!`/`log::error!` calls throughout this codebase (ai_client.rs,
-    // tiktok_api.rs, etc.) were silently going nowhere without a registered backend —
-    // this is what actually makes them show up in the dev terminal.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     tauri::Builder::default()
@@ -52,12 +49,6 @@ pub fn run() {
 
             app.manage(QueueManager::default());
             queue_manager::kick(app.handle().clone());
-            // Every other kick() trigger is reactive (an item was added, resumed, manually
-            // retried, ...) — nothing re-checks the queue purely because time has passed.
-            // A rate-limited item's automatic retry (schedule_rate_limit_retry) sets a
-            // future `scheduled_at` and otherwise just sits there until something calls
-            // kick() again; this periodic sweep is what actually makes that due retry fire
-            // on its own instead of requiring the user to open the app back up.
             {
                 let periodic_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -77,9 +68,6 @@ pub fn run() {
             app.manage(commands::youtube::DownloadManager::default());
             app.manage(commands::facebook::FacebookOAuthState::default());
 
-            // Main window starts hidden (tauri.conf.json) so the user never sees a blank
-            // white frame while React mounts and the initial data fetches resolve — this
-            // splash window covers that gap instead, and close_splashscreen swaps them.
             tauri::WebviewWindowBuilder::new(app, "splash", tauri::WebviewUrl::App("splash.html".into()))
                 .title("ClipFlow")
                 .inner_size(360.0, 420.0)
@@ -89,9 +77,6 @@ pub fn run() {
                 .always_on_top(true)
                 .build()?;
 
-            // Safety net: if the frontend never calls close_splashscreen (crashed before
-            // mounting, stuck fetch, etc.) don't leave the user staring at the splash
-            // forever — reveal the main window anyway after a generous timeout.
             let fallback_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
@@ -152,6 +137,7 @@ pub fn run() {
             commands::facebook::connect_facebook_account,
             commands::facebook::refresh_facebook_account,
             commands::queue::add_to_queue,
+            commands::queue::queue_and_render,
             commands::queue::get_queue,
             commands::queue::get_queue_for_account,
             commands::queue::pause_queue,
@@ -159,7 +145,10 @@ pub fn run() {
             commands::queue::retry_queue_item,
             commands::queue::remove_queue_item,
             commands::queue::clear_completed_queue,
+            commands::queue::clear_failed_queue,
             commands::queue::retry_offline_failures,
+            commands::queue::download_queue_video,
+            commands::queue::get_queue_diagnostics,
             commands::files::pick_file,
             commands::files::pick_directory,
             commands::watermark::upload_watermark,

@@ -3,10 +3,6 @@ import { Navigate, useNavigate } from "react-router-dom";
 import { useProjectStore } from "../stores/projectStore";
 import NewProjectDialog from "../components/NewProjectDialog";
 
-// "/" has no view of its own — ProjectDetail's own left-side project switcher already lists
-// every project, so a separate project-list page was pure duplication. This just forwards to
-// whichever project is most recent (get_projects orders by created_at DESC), or offers to
-// create the first one if there isn't one yet.
 export default function Home() {
   const { projects, fetchProjects, isLoading } = useProjectStore();
   const [showDialog, setShowDialog] = useState(false);

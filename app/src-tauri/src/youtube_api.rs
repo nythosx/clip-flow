@@ -1,24 +1,16 @@
-// YouTube Data API v3 + Google OAuth (Installed App / Desktop loopback flow) client.
-// Mirrors tiktok_api.rs's shape (PKCE + loopback listener + token exchange) since Google's
-// installed-app OAuth follows the same pattern gcloud/gh use, and the app already has a
-// working, tested implementation of that pattern to copy from.
+
 use serde::{Deserialize, Serialize};
 
 const AUTH_BASE: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const DATA_API_BASE: &str = "https://www.googleapis.com/youtube/v3";
-// Google's "Desktop app" / installed-app OAuth client type (see the provided
-// client_secret_*.json's `"installed"` key) accepts any `http://localhost:<port>` redirect
-// without pre-registering the exact port, unlike TikTok which requires an exact match — so
-// this can pick its own fixed port without a Developer Portal round-trip.
+
 pub const OAUTH_REDIRECT_PORT: u16 = 53683;
 
 pub fn redirect_uri() -> String {
     format!("http://localhost:{OAUTH_REDIRECT_PORT}")
 }
 
-/// `access_type=offline` + `prompt=consent` guarantee a refresh_token comes back even on a
-/// re-consent (Google otherwise only issues one the very first time an app is authorized).
 pub fn authorize_url(client_id: &str, state: &str, code_challenge: &str) -> String {
     let redirect = urlencoding_encode(&redirect_uri());
     let scope = urlencoding_encode(
@@ -188,9 +180,6 @@ impl Thumbnails {
     }
 }
 
-/// Fetches the signed-in user's own channel (`mine=true`) — used right after OAuth to show
-/// the connected channel's name/avatar/subscriber count, same purpose as
-/// `tiktok_api::fetch_user_info`.
 pub async fn fetch_my_channel(access_token: &str) -> Result<ChannelInfo, String> {
     let resp = client()
         .get(format!("{DATA_API_BASE}/channels?part=snippet,statistics&mine=true"))
@@ -225,9 +214,7 @@ pub struct VideoSearchResult {
     pub description: String,
     pub thumbnail_url: String,
     pub published_at: String,
-    // Filled in by a follow-up `videos.list` call after search.list (which doesn't return
-    // contentDetails/statistics on its own) — `None`/0.0 only if that follow-up call fails,
-    // so a card can still render without blocking the whole search on it.
+
     #[serde(default)]
     pub duration_seconds: f64,
     #[serde(default)]
@@ -262,13 +249,6 @@ struct SearchSnippet {
     thumbnails: Option<Thumbnails>,
 }
 
-/// Public search — uses the API key, not OAuth, since search.list only needs read access to
-/// public data (this is why a separate API key setting exists alongside the OAuth client).
-/// `order` mirrors YouTube's own sort options ("relevance" | "date" | "viewCount" | "rating"),
-/// `video_duration` its Duration filter ("any" | "short" | "medium" | "long"), and
-/// `published_after` its Upload date filter as an RFC3339 cutoff computed by the caller.
-/// Each is omitted from the request (falling back to the API's own default) when `None` or a
-/// no-op value, so old callers passing none of them behave exactly as before.
 pub async fn search_videos(
     api_key: &str,
     query: &str,
@@ -317,9 +297,6 @@ pub async fn search_videos(
         })
         .collect();
 
-    // search.list never returns duration/view count on its own — one follow-up videos.list
-    // batch call fills both in for every result at once. Best-effort: cards still render
-    // (just without the duration/views badges) if this second call fails for any reason.
     let ids: Vec<String> = results.iter().map(|r| r.video_id.clone()).collect();
     if let Ok(batch) = fetch_videos_batch_details(api_key, &ids).await {
         for r in results.iter_mut() {
@@ -412,8 +389,6 @@ struct VideoStatistics {
     view_count: Option<String>,
 }
 
-/// Parses an ISO 8601 duration like `PT1H2M3S` (YouTube's `contentDetails.duration` format)
-/// into seconds.
 fn parse_iso8601_duration(s: &str) -> f64 {
     let mut total = 0.0_f64;
     let mut num = String::new();
@@ -432,8 +407,7 @@ fn parse_iso8601_duration(s: &str) -> f64 {
                 num.clear();
             }
             'M' => {
-                // Month component in a pure-date duration — not expected for video lengths,
-                // ignored rather than mis-added as minutes.
+
                 num.clear();
             }
             'S' => {
@@ -477,13 +451,6 @@ pub async fn fetch_video_details(api_key: &str, video_id: &str) -> Result<VideoD
     })
 }
 
-/// Fetches YouTube's own auto-generated (or uploader-provided) captions for a public video
-/// via the unauthenticated `timedtext` endpoint — the same one YouTube's own player uses,
-/// and what tools like yt-dlp rely on for `--write-auto-sub`. The official Data API's
-/// `captions.download` deliberately does NOT work for videos you don't own (it 403s), so
-/// this is the only way to get a transcript for an arbitrary public video without the
-/// uploader's cooperation. Returns `None` (not an error) if the video has no captions in
-/// that language — most channels only have one or two languages available.
 pub async fn fetch_captions_srt(video_id: &str, lang: &str) -> Result<Option<String>, String> {
     let resp = client()
         .get(format!("https://www.youtube.com/api/timedtext?v={video_id}&lang={lang}&fmt=srv3"))
@@ -498,10 +465,6 @@ pub async fn fetch_captions_srt(video_id: &str, lang: &str) -> Result<Option<Str
     Ok(Some(timedtext_xml_to_srt(&body)))
 }
 
-/// Converts `timedtext`'s XML (`<p t="startMs" d="durMs">text</p>` entries, srv3 format)
-/// into SRT text so it can flow through the existing `transcript::parse_transcript` (Srt
-/// variant) unchanged — no separate transcript format needs to be taught to the rest of the
-/// app for a YouTube-sourced project.
 fn timedtext_xml_to_srt(xml: &str) -> String {
     let mut out = String::new();
     let mut index = 1;
@@ -574,9 +537,6 @@ fn format_srt_timestamp(seconds: f64) -> String {
     format!("{h:02}:{m:02}:{s:02},{ms:03}")
 }
 
-/// Blocks until the OAuth redirect hits `http://localhost:OAUTH_REDIRECT_PORT/`, returning
-/// `code`/`state`. Same shape as `tiktok_api::await_oauth_callback` (2-minute timeout so a
-/// denied/abandoned consent screen can't hold the port forever).
 pub async fn await_oauth_callback() -> Result<(String, String), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;

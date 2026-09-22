@@ -1,10 +1,4 @@
-// Plays the same role `cli/lib/server.js` + `cli/index.js` play in the AI Engine repo
-// (../cli, ../native-host, ../extension, ../shared/protocol.js): starts a local WebSocket
-// server, writes the well-known port file the native-host already polls, and speaks the
-// `AI_MESSAGE_TYPES` protocol (shared/protocol.js) request/response shape — one JSON
-// message out per call, matched back to its response by `requestId`. The native-host and
-// extension are unmodified; only the caller changed, per README.md's "Suggested next
-// steps" item 1.
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -16,11 +10,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 const PREFERRED_PORT: u16 = 9876;
-const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(20 * 60); // real AI calls are slow (typing pacing, rate-limit gate, model response, occasional migration)
+const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 fn well_known_dir() -> PathBuf {
-    // Must match cli/lib/server.js's WELL_KNOWN_DIR and native-host/host.js's PORT_FILE —
-    // this is the discovery handshake the always-on native host polls.
+
     dirs_home().join(".clipflow")
 }
 
@@ -38,12 +31,7 @@ fn port_file() -> PathBuf {
 pub struct AiClient {
     outgoing: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
-    // requestId -> narration sink, registered by a caller (call_ai_tracked) BEFORE issuing
-    // the call so it can turn the extension's non-terminal "ai_status" pings (see
-    // shared/protocol.js's AI_STATUS doc comment) into a live activity-log entry instead of
-    // the caller only finding out once the whole multi-minute call finishes. Separate from
-    // `pending` since a oneshot::Sender can only ever fire once, but a single call can emit
-    // several of these before its real result arrives.
+
     status_subs: Mutex<HashMap<String, mpsc::UnboundedSender<String>>>,
 }
 
@@ -56,24 +44,16 @@ impl AiClient {
         })
     }
 
-    /// Registers a narration sink for `request_id` — must be called before `call_ai`/
-    /// `call_ai_default_timeout` for that same request_id, since status pings can arrive
-    /// any time after the request is sent. The returned receiver stays open until the
-    /// caller drops it; `call_ai` unregisters the sender side once the call itself resolves
-    /// (success, error, or timeout) so nothing leaks across calls.
     pub async fn subscribe_status(&self, request_id: &str) -> mpsc::UnboundedReceiver<String> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.status_subs.lock().await.insert(request_id.to_string(), tx);
         rx
     }
 
-    /// Binds the WS server, writes the port file, and spawns the accept loop in the
-    /// background. Returns once listening (not once a client has connected — the
-    /// native-host connects whenever it next polls the port file).
     pub async fn start(self: &Arc<Self>) -> std::io::Result<()> {
         let listener = match TcpListener::bind(("127.0.0.1", PREFERRED_PORT)).await {
             Ok(l) => l,
-            Err(_) => TcpListener::bind(("127.0.0.1", 0)).await?, // fall back to an OS-assigned free port
+            Err(_) => TcpListener::bind(("127.0.0.1", 0)).await?,
         };
         let port = listener.local_addr()?.port();
 
@@ -112,7 +92,6 @@ impl AiClient {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         *self.outgoing.lock().await = Some(tx);
 
-        // Drain queued outgoing messages onto the socket.
         let send_task = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if write.send(msg).await.is_err() {
@@ -153,8 +132,7 @@ impl AiClient {
 
         let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if msg_type == "ai_status" {
-            // Non-terminal — never touches `pending`, since the real result/ai_error for
-            // this request_id is still coming.
+
             if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
                 if let Some(sender) = self.status_subs.lock().await.get(request_id) {
                     let _ = sender.send(message.to_string());
@@ -165,7 +143,7 @@ impl AiClient {
 
         let mut pending = self.pending.lock().await;
         let Some(sender) = pending.remove(request_id) else {
-            return; // no one waiting (already timed out, or a stray/duplicate message)
+            return;
         };
         drop(pending);
 
@@ -177,10 +155,6 @@ impl AiClient {
         }
     }
 
-    /// Sends one AI_MESSAGE_TYPES request and resolves with the matching response (by
-    /// `requestId`) or times out. `payload` should already have `type` set (and whichever
-    /// function-specific fields — `transcript`, `duration`, `count`, `excerpt`, `hook`,
-    /// `sessionKey`); `requestId` is generated here if not already present.
     pub async fn call_ai(&self, mut payload: Value, timeout: Duration) -> Result<Value, String> {
         let request_id = payload
             .get("requestId")
@@ -214,9 +188,7 @@ impl AiClient {
                 Err(format!("AI Engine call timed out after {}s", timeout.as_secs()))
             }
         };
-        // Whichever subscribe_status receiver was registered for this call is done hearing
-        // about it either way — drop the sender so a leftover status ping after this point
-        // (a stray/duplicate message) has nowhere to go instead of silently accumulating.
+
         self.status_subs.lock().await.remove(&request_id);
         result
     }
@@ -225,11 +197,6 @@ impl AiClient {
         self.call_ai(payload, DEFAULT_CALL_TIMEOUT).await
     }
 
-    /// Unblocks a pending `call_ai`/`call_ai_default_timeout` for `request_id` immediately,
-    /// resolving it with an error instead of waiting out the full timeout. The AI Engine
-    /// itself (the live browser tab) isn't told to stop — there's no cancel message in the
-    /// protocol for a call already in flight — this only stops the Rust side from waiting
-    /// on it, which is what actually unsticks a caller like `analyze_clips`/`analyze_movie`.
     pub async fn cancel_request(&self, request_id: &str) -> bool {
         let mut pending = self.pending.lock().await;
         if let Some(sender) = pending.remove(request_id) {

@@ -1,20 +1,12 @@
 use crate::db::Db;
 use crate::ffmpeg;
+use crate::queue_manager;
 use crate::render_manager::{self, RenderManager};
 use crate::transcript;
 use rusqlite::params;
 use std::path::Path;
 use tauri::{AppHandle, Manager, State};
 
-/// Extracts a clip's time range from its parent project's movie file into
-/// `<app_data_dir>/renders/<clip_id>.mp4` so it can be played in-app before upload
-/// (NEXT_PHASE.md Phase 3 — preview only, not the template-based final render).
-///
-/// Goes through `RenderManager`'s single-permit semaphore so that firing this (or
-/// `render_clip_final`) for several clips back to back queues the actual ffmpeg work
-/// instead of running multiple encodes at once — see render_manager.rs's module doc.
-/// Navigating away in the frontend doesn't cancel this: it's a plain awaited Tauri command
-/// that keeps running server-side regardless of whether anything is still awaiting it.
 #[tauri::command]
 pub async fn render_clip_preview(app: AppHandle, db: State<'_, Db>, clip_id: String) -> Result<String, String> {
     let job_id = render_manager::insert_job(&app, &clip_id, "preview", None)?;
@@ -26,7 +18,10 @@ pub async fn render_clip_preview(app: AppHandle, db: State<'_, Db>, clip_id: Str
     let result = render_clip_preview_inner(&app, &db, &clip_id).await;
 
     match &result {
-        Ok(_) => render_manager::set_status(&app, &job_id, "completed", None),
+        Ok(_) => {
+            render_manager::set_status(&app, &job_id, "completed", None);
+            queue_manager::kick(app.clone());
+        }
         Err(e) => render_manager::set_status(&app, &job_id, "failed", Some(e)),
     }
     result
@@ -46,7 +41,8 @@ async fn render_clip_preview_inner(app: &AppHandle, db: &State<'_, Db>, clip_id:
     };
 
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let output_path = app_data_dir.join("renders").join(format!("{clip_id}.mp4"));
+    let short_clip: String = clip_id.chars().filter(|c| *c != '-').take(12).collect();
+    let output_path = app_data_dir.join("renders").join(format!("{short_clip}.mp4"));
 
     ffmpeg::extract_clip(&movie_path, start_seconds, end_seconds, &output_path)?;
 
@@ -63,27 +59,35 @@ async fn render_clip_preview_inner(app: &AppHandle, db: &State<'_, Db>, clip_id:
     Ok(output_path_str)
 }
 
-/// Renders a clip through a saved template's full pipeline (SPEC.md sections 4/5) — the
-/// platform-ready final render, as opposed to `render_clip_preview`'s raw trim. Shares
-/// `RenderManager`'s semaphore with `render_clip_preview` — see its doc comment.
 #[tauri::command]
-pub async fn render_clip_final(
+pub async fn render_clip_final(app: AppHandle, clip_id: String, template_id: String) -> Result<String, String> {
+    let job_id = render_manager::insert_job(&app, &clip_id, "final", Some(&template_id))?;
+    run_final_render_job(app, clip_id, template_id, job_id).await
+}
+
+pub(crate) async fn run_final_render_job(
     app: AppHandle,
-    db: State<'_, Db>,
     clip_id: String,
     template_id: String,
+    job_id: String,
 ) -> Result<String, String> {
-    let job_id = render_manager::insert_job(&app, &clip_id, "final", Some(&template_id))?;
     let manager = app.state::<RenderManager>();
     let semaphore = manager.semaphore.clone();
     let _permit = semaphore.acquire_owned().await.map_err(|e| e.to_string())?;
     render_manager::set_status(&app, &job_id, "rendering", None);
 
+    let db = app.state::<Db>();
     let result = render_clip_final_inner(&app, &db, &clip_id, &template_id).await;
 
     match &result {
-        Ok(_) => render_manager::set_status(&app, &job_id, "completed", None),
-        Err(e) => render_manager::set_status(&app, &job_id, "failed", Some(e)),
+        Ok(_) => {
+            render_manager::set_status(&app, &job_id, "completed", None);
+            queue_manager::kick(app.clone());
+        }
+        Err(e) => {
+            render_manager::set_status(&app, &job_id, "failed", Some(e));
+            queue_manager::fail_rows_awaiting_render(&app, &clip_id, &template_id, e);
+        }
     }
     result
 }
@@ -114,8 +118,6 @@ async fn render_clip_final_inner(
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
             )
             .map_err(|e| e.to_string())?;
-        // 1-based rank of this clip among same-project, same-kind siblings ordered by
-        // start_seconds — matches the frontend timeline's "Part N" numbering exactly.
         let part_number: i64 = conn
             .query_row(
                 "SELECT COUNT(*) + 1 FROM clips WHERE project_id = ?1 AND kind = ?2 AND start_seconds < ?3",
@@ -135,11 +137,6 @@ async fn render_clip_final_inner(
 
     let mut template: ffmpeg::TemplateConfig =
         serde_json::from_str(&config_json).map_err(|e| format!("invalid template config: {e}"))?;
-    // The template stores literal placeholders "{ai_caption}"/"{part_number}" — substitute
-    // the clip's actual values before burning either caption into the frame (matches the
-    // live preview's resolveCaptionText() in app/src/lib/templatePreview.ts). Both
-    // placeholders are supported in both caption slots — e.g. nothing stops a "Part
-    // {part_number}: {ai_caption}" style combined caption.
     let resolve = |text: &str| -> String {
         text.replace("{ai_caption}", ai_caption.as_deref().unwrap_or(""))
             .replace("{part_number}", &part_number.to_string())
@@ -147,11 +144,6 @@ async fn render_clip_final_inner(
     template.caption.text = resolve(&template.caption.text);
     template.caption2.text = resolve(&template.caption2.text);
 
-    // Transcript entries overlapping this clip's time range, shifted from the movie's
-    // absolute timeline to clip-relative seconds — `-ss` before `-i` in render_final already
-    // zeroes ffmpeg's own `t` at the trim point, so `drawtext`'s `enable=between(t,...)` for
-    // each cue needs to agree with that same zero point. Silently empty (not an error) when
-    // there's no transcript, or subtitles are off — most templates won't use this track.
     let subtitle_cues: Vec<(f64, f64, String)> = if template.subtitle.enabled {
         transcript_path
             .as_deref()
@@ -166,10 +158,12 @@ async fn render_clip_final_inner(
     };
 
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let short_clip: String = clip_id.chars().filter(|c| *c != '-').take(12).collect();
+    let short_tpl: String = template_id.chars().filter(|c| *c != '-').take(12).collect();
     let output_path = app_data_dir
         .join("renders")
         .join("final")
-        .join(format!("{clip_id}_{template_id}.mp4"));
+        .join(format!("{short_clip}_{short_tpl}.mp4"));
 
     ffmpeg::render_final(&movie_path, start_seconds, end_seconds, &template, &subtitle_cues, &output_path)?;
 
@@ -186,9 +180,6 @@ async fn render_clip_final_inner(
     Ok(output_path_str)
 }
 
-/// Cached single-frame thumbnail — used for the movie thumbnail and per-clip timeline
-/// thumbnails in the project editor UI. `cache_key` is caller-chosen (project id or clip
-/// id); regeneration is skipped if a thumbnail for that key already exists on disk.
 #[tauri::command]
 pub async fn get_thumbnail(
     app: AppHandle,
@@ -206,10 +197,6 @@ pub async fn get_thumbnail(
     Ok(output_path.to_string_lossy().to_string())
 }
 
-/// Currently queued/in-progress render jobs (preview or final, any project) — lets the
-/// frontend show a small background-work indicator instead of the user having to guess
-/// whether a render they kicked off earlier (possibly from a project they've since
-/// navigated away from) is still running.
 #[tauri::command]
 pub async fn get_render_queue(db: State<'_, Db>) -> Result<Vec<render_manager::RenderQueueItem>, String> {
     render_manager::get_queue(&db)
@@ -222,11 +209,6 @@ pub struct SubtitleCueDto {
     pub text: String,
 }
 
-/// Same clip-relative cue timing `render_final` burns into the video (via
-/// `transcript::compute_cues`), exposed to the frontend so the in-app live preview (the
-/// raw-trim CSS overlay, before a real render exists) can show the same subtitle lines at
-/// the same instants instead of only showing them once uploaded. Empty (not an error) when
-/// the project has no transcript.
 #[tauri::command]
 pub async fn get_clip_subtitle_cues(db: State<'_, Db>, clip_id: String) -> Result<Vec<SubtitleCueDto>, String> {
     let (start_seconds, end_seconds, transcript_path, transcript_offset_seconds): (f64, f64, Option<String>, f64) = {

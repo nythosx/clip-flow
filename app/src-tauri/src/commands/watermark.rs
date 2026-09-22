@@ -22,10 +22,6 @@ fn row_to_watermark(row: &rusqlite::Row) -> rusqlite::Result<Watermark> {
     })
 }
 
-/// Copies a user-picked image (which can live anywhere on disk) into
-/// `<app_data_dir>/watermarks/`, the only place besides renders/thumbnails the Tauri asset
-/// protocol is scoped to serve from (see tauri.conf.json) — without this copy, the picked
-/// file's original path can't be displayed via `convertFileSrc` in the preview/editor.
 #[tauri::command]
 pub async fn upload_watermark(
     app: AppHandle,

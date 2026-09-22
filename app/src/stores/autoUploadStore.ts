@@ -32,7 +32,7 @@ export const useAutoUploadStore = create<AutoUploadStore>((set, get) => ({
       const raw = settingsMap[SETTING_KEY];
       if (raw) set({ settings: JSON.parse(raw) as AutoUploadSettings });
     } catch {
-      // Leave settings null — the Auto Upload button surfaces "configure first" itself.
+
     }
   },
 
@@ -41,11 +41,6 @@ export const useAutoUploadStore = create<AutoUploadStore>((set, get) => ({
     set({ settings });
   },
 
-  /// The hands-off pipeline: slice (if not already), backfill AI captions, render every
-  /// clip/part still missing a final render with the default template, then queue every
-  /// ready one to every default account not already queued for it. Every step is skipped if
-  /// its work is already done, so clicking this again on an already-processed project is a
-  /// safe, cheap no-op rather than redoing everything.
   runAutoUpload: async (projectId) => {
     const { settings } = get();
     if (!settings || !settings.templateId || settings.accountIds.length === 0) {
@@ -64,10 +59,7 @@ export const useAutoUploadStore = create<AutoUploadStore>((set, get) => ({
 
       if (!alreadySliced) {
         set({ progressLabel: settings.mode === "movie" ? "Slicing full video…" : "Slicing clips…" });
-        // analyzeClips/analyzeMovie swallow their own errors into projectStore.error rather
-        // than rejecting (existing behavior, shared with the manual Analyze button) — check
-        // for one explicitly so a slicing failure actually stops the pipeline here instead
-        // of silently continuing on to render/queue steps with zero clips to work with.
+
         if (settings.mode === "movie") {
           await projectStore.analyzeMovie(projectId);
         } else {
@@ -80,9 +72,6 @@ export const useAutoUploadStore = create<AutoUploadStore>((set, get) => ({
       await projectStore.fetchClips(projectId);
       let clips = useProjectStore.getState().clips.filter((c) => c.kind === kind);
 
-      // analyzeClips/analyzeMovie already backfill missing captions on their own, but a
-      // previously-sliced project (alreadySliced above) skips that path entirely, so check
-      // again here in case this is a re-run on older content.
       if (clips.some((c) => !c.aiCaption)) {
         set({ progressLabel: "Generating captions…" });
         await invoke("generate_missing_captions", { projectId, kind });

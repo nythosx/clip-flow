@@ -99,7 +99,7 @@ export default function Settings() {
       try {
         setEncoding(JSON.parse(raw));
       } catch {
-        // ignore malformed stored value, keep fallback
+
       }
     }
   }, [settings]);

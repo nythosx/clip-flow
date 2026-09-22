@@ -1,5 +1,4 @@
-// Transcript parser (SPEC.md section 7): SRT, VTT, and plain-text formats, auto-detected
-// by file extension first, falling back to content sniffing.
+
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -12,12 +11,11 @@ pub enum TranscriptFormat {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TranscriptEntry {
-    pub start: f64, // seconds
-    pub end: f64,   // seconds (may equal start for plain text)
+    pub start: f64,
+    pub end: f64,
     pub text: String,
 }
 
-/// Parses "HH:MM:SS,mmm" / "HH:MM:SS.mmm" / "HH:MM:SS" / "MM:SS" into seconds.
 pub fn parse_timestamp(raw: &str) -> Option<f64> {
     let raw = raw.trim();
     let (main, millis) = match raw.split_once([',', '.']) {
@@ -37,7 +35,7 @@ pub fn parse_timestamp(raw: &str) -> Option<f64> {
 fn parse_timestamp_range(line: &str) -> Option<(f64, f64)> {
     let (start_raw, end_raw) = line.split_once("-->")?;
     let start = parse_timestamp(start_raw)?;
-    // The end side may carry trailing cue settings (VTT), e.g. "00:00:05.000 align:start".
+
     let end_raw = end_raw.split_whitespace().next()?;
     let end = parse_timestamp(end_raw)?;
     Some((start, end))
@@ -55,11 +53,6 @@ fn split_blocks(content: &str) -> Vec<Vec<&str>> {
         .collect()
 }
 
-/// Strips inline markup — WebVTT/SRT text lines commonly carry styling tags like `<i>`,
-/// `<b>`, `<font color="...">`, `<c.classname>`, or per-word timestamp tags like
-/// `<00:00:01.000>` — and decodes the handful of HTML entities exported alongside them.
-/// Without this, burning the raw text into the frame (or showing it in the in-app preview)
-/// puts literal "<i>"/"&amp;" on screen instead of the styling/character it represents.
 fn strip_markup(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_tag = false;
@@ -86,9 +79,7 @@ fn parse_srt(content: &str) -> Vec<TranscriptEntry> {
     let normalized = normalize_line_endings(content);
     let mut entries = Vec::new();
     for block in split_blocks(&normalized) {
-        // Block shape: [index, "00:00:00,000 --> 00:00:05,000", text..., text...]
-        // (the index line is optional/malformed in some exports — search for the arrow
-        // line rather than assuming it's always line 1.)
+
         let Some(ts_line_idx) = block.iter().position(|l| l.contains("-->")) else { continue };
         let Some((start, end)) = parse_timestamp_range(block[ts_line_idx]) else { continue };
         let text = strip_markup(&block[ts_line_idx + 1..].join("\n"));
@@ -101,8 +92,7 @@ fn parse_srt(content: &str) -> Vec<TranscriptEntry> {
 
 fn parse_vtt(content: &str) -> Vec<TranscriptEntry> {
     let normalized = normalize_line_endings(content);
-    // Strip the WEBVTT header block (and any NOTE blocks) — everything else has the same
-    // cue shape as SRT: optional identifier line, timestamp line, text lines.
+
     let mut entries = Vec::new();
     for block in split_blocks(&normalized) {
         let Some(ts_line_idx) = block.iter().position(|l| l.contains("-->")) else { continue };
@@ -115,7 +105,6 @@ fn parse_vtt(content: &str) -> Vec<TranscriptEntry> {
     entries
 }
 
-/// Matches a leading `[HH:MM:SS]` or `HH:MM:SS -` / `HH:MM:SS:` prefix on a line.
 fn parse_plain_line(line: &str) -> Option<(f64, String)> {
     let line = line.trim();
     if let Some(rest) = line.strip_prefix('[') {
@@ -123,7 +112,7 @@ fn parse_plain_line(line: &str) -> Option<(f64, String)> {
         let start = parse_timestamp(ts)?;
         return Some((start, after.trim_start_matches([' ', '-', ':']).trim().to_string()));
     }
-    // "HH:MM:SS - text" or "HH:MM:SS: text" or "HH:MM:SS text"
+
     let ts_end = line
         .char_indices()
         .find(|(_, c)| !(c.is_ascii_digit() || *c == ':' || *c == '.' || *c == ','))
@@ -134,7 +123,7 @@ fn parse_plain_line(line: &str) -> Option<(f64, String)> {
     }
     let ts_candidate = &line[..ts_end];
     if !ts_candidate.contains(':') {
-        return None; // not timestamp-shaped — avoid false positives on plain prose
+        return None;
     }
     let start = parse_timestamp(ts_candidate)?;
     let rest = line[ts_end..].trim_start_matches([' ', '-', ':']).trim();
@@ -169,10 +158,6 @@ pub fn detect_format(path: &Path, content: &str) -> TranscriptFormat {
     }
 }
 
-/// Shifts every entry's start/end by a constant `offset_seconds` (positive = later, negative
-/// = earlier) — the manual correction for a transcript that's out of sync with the movie
-/// file it's paired with (see commands::project::get_transcript_sync_status /
-/// set_transcript_offset). Clamped at 0 rather than going negative.
 pub fn apply_offset(entries: &mut [TranscriptEntry], offset_seconds: f64) {
     for entry in entries.iter_mut() {
         entry.start = (entry.start + offset_seconds).max(0.0);
@@ -180,10 +165,6 @@ pub fn apply_offset(entries: &mut [TranscriptEntry], offset_seconds: f64) {
     }
 }
 
-/// Transcript entries overlapping `[clip_start, clip_end)`, shifted to clip-relative
-/// seconds — shared by the final-render subtitle burn-in (ffmpeg drawtext `enable` windows)
-/// and the in-app live preview (time-gated by the `<video>`'s currentTime), so both agree on
-/// exactly which line is on screen at a given instant.
 pub fn compute_cues(entries: &[TranscriptEntry], clip_start: f64, clip_end: f64) -> Vec<(f64, f64, String)> {
     let mut entries = entries.to_vec();
     entries.sort_by(|a, b| a.start.total_cmp(&b.start));
@@ -191,9 +172,7 @@ pub fn compute_cues(entries: &[TranscriptEntry], clip_start: f64, clip_end: f64)
     (0..n)
         .filter_map(|i| {
             let entry = &entries[i];
-            // Plain-text transcripts have no real end timestamp — every entry comes out
-            // with `end == start`. Display it until the next line starts (capped at 6s so
-            // a long silent gap doesn't leave a stale line on screen) instead.
+
             let effective_end = if entry.end > entry.start {
                 entry.end
             } else {
@@ -210,7 +189,6 @@ pub fn compute_cues(entries: &[TranscriptEntry], clip_start: f64, clip_end: f64)
         .collect()
 }
 
-/// Formats seconds as "HH:MM:SS" — the timestamp shape SPEC.md's AI prompts use.
 pub fn format_timestamp(seconds: f64) -> String {
     let total = seconds.max(0.0).round() as i64;
     format!("{:02}:{:02}:{:02}", total / 3600, (total % 3600) / 60, total % 60)

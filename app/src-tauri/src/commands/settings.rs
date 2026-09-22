@@ -27,10 +27,6 @@ pub async fn set_setting(db: tauri::State<'_, Db>, key: String, value: String) -
     Ok(())
 }
 
-/// Read-only: lets the Settings page show where renders actually live, since the render
-/// directory itself isn't user-configurable yet (Tauri's asset-protocol scope is static
-/// per NEXT_PHASE.md/Phase 3 — an arbitrary user-chosen directory can't be added to it at
-/// runtime without an app restart and a scope change in tauri.conf.json).
 #[tauri::command]
 pub async fn get_app_data_dir(app: AppHandle) -> Result<String, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;

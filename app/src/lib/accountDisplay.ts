@@ -34,8 +34,8 @@ export interface AccountCredentials {
   subscriberCount?: number;
   viewCount?: number;
   expiresAt?: string;
-  accountType?: "user" | "page"; // Facebook only — personal profile vs. a managed Page
-  category?: string; // Facebook Page only
+  accountType?: "user" | "page";
+  category?: string;
 }
 
 export function parseCredentials(a: Account): AccountCredentials {
@@ -53,8 +53,6 @@ export function formatCount(n?: number): string | null {
   return String(n);
 }
 
-// TikTok's granted scope (user.info.basic) can't re-fetch stats without the full OAuth
-// browser round-trip, so it has no lightweight refresh — only Reconnect, from the list page.
 export function statsRefreshablePlatform(platform: string): boolean {
   return platform === "facebook" || platform === "youtube";
 }

@@ -1,12 +1,4 @@
-// Serializes actual ffmpeg render work app-wide (SPEC-adjacent to queue_manager.rs's upload
-// queue, same rationale: SQLite is the single source of truth for queue state, not an
-// in-memory list). ffmpeg is CPU-bound, so running two encodes at once just makes both
-// slower rather than actually finishing sooner — a single permit turns concurrent render
-// requests (preview or final, any clip) into a real FIFO queue instead of a resource race.
-// Waiting for a permit only blocks the specific `render_clip_preview`/`render_clip_final`
-// call that's waiting on it; every other Tauri command (navigation, other invokes) keeps
-// running immediately, and a caller that navigates away doesn't cancel the job — it keeps
-// running in the background and the render_queue row/event just aren't watched anymore.
+
 use crate::db::Db;
 use rusqlite::params;
 use serde::Serialize;
@@ -14,13 +6,15 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Semaphore;
 
+const MAX_CONCURRENT_RENDERS: usize = 5;
+
 pub struct RenderManager {
     pub semaphore: Arc<Semaphore>,
 }
 
 impl Default for RenderManager {
     fn default() -> Self {
-        Self { semaphore: Arc::new(Semaphore::new(1)) }
+        Self { semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_RENDERS)) }
     }
 }
 
@@ -36,8 +30,6 @@ pub struct RenderQueueItem {
     pub created_at: String,
 }
 
-/// Inserts a `queued` row and emits `render_queue_update` so any open queue viewer refreshes
-/// immediately, before the caller even starts waiting on the semaphore permit.
 pub fn insert_job(app: &AppHandle, clip_id: &str, kind: &str, template_id: Option<&str>) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let db = app.state::<Db>();

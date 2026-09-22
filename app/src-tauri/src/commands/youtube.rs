@@ -9,20 +9,16 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// Same purpose as `TikTokOAuthState` (commands/account.rs): aborts any stuck prior OAuth
-/// attempt before starting a new one so the loopback port never gets stuck "already in use".
 #[derive(Default)]
 pub struct YouTubeOAuthState(pub Mutex<Option<tokio::task::AbortHandle>>);
 
-/// One row in the Chrome-style downloads list — the frontend's `get_youtube_downloads` /
-/// `youtube_download_progress` event payload.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadRecord {
     pub video_id: String,
     pub title: String,
     pub thumbnail_url: String,
-    /// "downloading" | "paused" | "captions" | "creating_project" | "completed" | "failed" | "cancelled"
+
     pub status: String,
     pub percent: Option<f64>,
     pub message: String,
@@ -36,16 +32,6 @@ enum PendingAction {
     Cancel,
 }
 
-/// Backs the whole downloads list: every YouTube import in progress or finished this
-/// session, keyed by video id, plus enough bookkeeping to actually interrupt one —
-/// `pids` for killing the live `yt-dlp` process, `pending_action` for the (Pause|Cancel)
-/// a user clicked that the process-exit handler picks up once the kill actually lands.
-///
-/// Plain `std::sync::Mutex`es, not `tokio::sync::Mutex` — every access here is a quick
-/// in-memory read/write, never held across an `.await`. An earlier version of this file's
-/// single-download predecessor (`YouTubeImportState`) held a tokio Mutex locked across
-/// `child.wait().await`, which meant Cancel/Pause trying to lock the same mutex just queued
-/// silently for the entire download. Not repeating that here.
 #[derive(Default)]
 pub struct DownloadManager {
     records: Mutex<HashMap<String, DownloadRecord>>,
@@ -86,9 +72,6 @@ fn get_pid(manager: &DownloadManager, video_id: &str) -> Option<u32> {
     manager.pids.lock().ok()?.get(video_id).copied()
 }
 
-/// `/T` also kills the process tree — yt-dlp shells out to ffmpeg for the video+audio merge
-/// step, which has its own PID and would otherwise keep running (and keep the partial output
-/// file locked) after yt-dlp itself was killed.
 fn kill_pid(pid: u32) {
     #[cfg(windows)]
     let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
@@ -112,10 +95,6 @@ pub async fn remove_youtube_download(manager: tauri::State<'_, DownloadManager>,
     Ok(())
 }
 
-/// Kills the live download if there is one; the exit handler in `run_ytdlp_process` picks up
-/// the pending Pause and marks the record "paused" — the partial `.part` file is left in
-/// place so `resume_youtube_download` continues instead of restarting from zero (yt-dlp
-/// resumes partial downloads by default).
 #[tauri::command]
 pub async fn pause_youtube_download(manager: tauri::State<'_, DownloadManager>, video_id: String) -> Result<(), String> {
     set_pending(&manager, &video_id, PendingAction::Pause);
@@ -125,9 +104,6 @@ pub async fn pause_youtube_download(manager: tauri::State<'_, DownloadManager>, 
     Ok(())
 }
 
-/// Same idea as pause, except the file gets deleted once the process actually stops — and if
-/// nothing is currently running for this id (it was already paused), there's no exit handler
-/// coming to apply the pending action, so this finishes the job itself right here.
 #[tauri::command]
 pub async fn cancel_youtube_download(
     app: AppHandle,
@@ -149,8 +125,6 @@ pub async fn cancel_youtube_download(
     Ok(())
 }
 
-/// Re-runs the whole import pipeline for a paused/failed download — the video-download step
-/// picks the partial file back up automatically, so this isn't a from-scratch restart.
 #[tauri::command]
 pub async fn resume_youtube_download(
     app: AppHandle,
@@ -169,11 +143,6 @@ pub async fn resume_youtube_download(
     Ok(())
 }
 
-/// Starts a new download and returns immediately — progress/completion is entirely
-/// event/list-driven from here (`youtube_download_progress` events plus
-/// `get_youtube_downloads`), Chrome-downloads-tray style, rather than the caller awaiting
-/// one long command. A no-op if this video is already downloading (guards against a
-/// double-click spawning two `yt-dlp` processes for the same output file).
 #[tauri::command]
 pub async fn start_youtube_download(
     app: AppHandle,
@@ -290,9 +259,6 @@ async fn run_ytdlp_process(app: &AppHandle, manager: &DownloadManager, video_id:
     }
 }
 
-/// Extracts the percentage from a `yt-dlp --newline` progress line, e.g.
-/// `[download]  45.2% of  123.45MiB at    2.50MiB/s ETA 00:12` → `45.2`. Returns `None` for
-/// any other line (yt-dlp interleaves plenty of non-progress status lines).
 fn parse_ytdlp_percent(line: &str) -> Option<f64> {
     let line = line.trim_start();
     if !line.starts_with("[download]") {
@@ -319,11 +285,6 @@ fn row_to_account(row: &rusqlite::Row) -> rusqlite::Result<Account> {
     })
 }
 
-/// Runs the full Google OAuth (installed-app / Desktop loopback) flow: opens the system
-/// browser to Google's consent screen, catches the redirect, exchanges the code for tokens,
-/// fetches the connected channel's profile, and upserts an `accounts` row keyed by YouTube
-/// channel id — same shape as `connect_tiktok_account`, so reconnecting the same channel
-/// updates its row instead of erroring or duplicating.
 #[tauri::command]
 pub async fn connect_youtube_account(
     app: AppHandle,
@@ -381,9 +342,6 @@ pub async fn connect_youtube_account(
         )
         .ok();
 
-    // A re-consent can omit refresh_token (Google only issues one on first authorization
-    // unless `prompt=consent` forces a fresh one, which authorize_url already sets) — but
-    // guard anyway so reconnecting never blanks out a previously-stored refresh_token.
     let id = match existing_id {
         Some(id) => {
             if token.refresh_token.is_some() {
@@ -416,11 +374,6 @@ pub async fn connect_youtube_account(
         .map_err(|e| e.to_string())
 }
 
-/// Re-fetches the channel's subscriber/video/view counts and avatar and merges them into the
-/// stored credentials — the lightweight "give me current stats" refresh behind Accounts'
-/// account-details view, without re-running the whole OAuth browser flow (same purpose as
-/// `refresh_facebook_account`). Transparently refreshes the access token first if it's expired,
-/// since unlike Facebook Page tokens, Google's access tokens expire in about an hour.
 #[tauri::command]
 pub async fn refresh_youtube_account(db: tauri::State<'_, Db>, account_id: String) -> Result<Account, String> {
     let (access_token, refresh_token, expires_at, client_id, client_secret) = {
@@ -502,10 +455,6 @@ pub async fn youtube_video_details(db: tauri::State<'_, Db>, video_id: String) -
     youtube_api::fetch_video_details(&api_key, &video_id).await
 }
 
-/// Returns caption text for preview (search results panel) plus the on-disk `.vtt` path if
-/// one was written — `youtube_import_project` reuses that path directly as the project's
-/// transcript file instead of re-fetching, since `transcript::parse_transcript` already
-/// understands VTT natively.
 async fn fetch_captions(app: &AppHandle, video_id: &str) -> Result<Option<(String, PathBuf)>, String> {
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let dl_dir = app_data_dir.join("youtube_downloads");
@@ -516,11 +465,6 @@ async fn fetch_captions(app: &AppHandle, video_id: &str) -> Result<Option<(Strin
         return Ok(Some((content, path)));
     }
 
-    // Prefer yt-dlp — it keeps up with YouTube's own caption-delivery changes (signature
-    // requirements, PO tokens, etc.) the way a hand-rolled `timedtext` request can't; that
-    // unauthenticated endpoint alone turned out to return nothing for most videos in
-    // practice. `--skip-download` makes this a metadata-only, low-cost call even though the
-    // same binary is also used for the full video download in `youtube_import_project`.
     if yt_dlp_path().is_ok() {
         let url = format!("https://www.youtube.com/watch?v={video_id}");
         let out_template = dl_dir.join(format!("{video_id}.%(ext)s"));
@@ -550,9 +494,6 @@ async fn fetch_captions(app: &AppHandle, video_id: &str) -> Result<Option<(Strin
         }
     }
 
-    // Last-resort fallback if yt-dlp is missing or found nothing — the unauthenticated
-    // `timedtext` endpoint, converted to SRT (see youtube_api::fetch_captions_srt's doc
-    // comment on why this alone isn't relied on as the primary path anymore).
     for lang in ["en", "a.en"] {
         if let Some(srt) = youtube_api::fetch_captions_srt(video_id, lang).await? {
             let path = dl_dir.join(format!("{video_id}.srt"));
@@ -563,9 +504,6 @@ async fn fetch_captions(app: &AppHandle, video_id: &str) -> Result<Option<(Strin
     Ok(None)
 }
 
-/// `yt-dlp` names subtitle files `<video_id>.<lang>.vtt` (language code inserted before the
-/// extension, ignoring the `%(ext)s` template) — this looks for whatever language it
-/// actually wrote rather than assuming `en` specifically.
 fn find_cached_vtt(dl_dir: &std::path::Path, video_id: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dl_dir).ok()?;
     let prefix = format!("{video_id}.");
@@ -597,23 +535,12 @@ fn yt_dlp_path() -> Result<PathBuf, String> {
         })
 }
 
-/// Top-level task body spawned by `start_youtube_download`/`resume_youtube_download` — logs
-/// and swallows the `Result` since there's no caller left to hand it to by the time this
-/// runs (the command that spawned it already returned); `run_download_inner` updates the
-/// shared `DownloadRecord` at every stage, so the list/event stream is the real "return
-/// value" here, not this function's.
 async fn run_download(app: AppHandle, video_id: String) {
     if let Err(e) = run_download_inner(&app, &video_id).await {
         log::warn!("[youtube download] {video_id} ended: {e}");
     }
 }
 
-/// Downloads a public YouTube video's best progressive/mux'd MP4 stream to
-/// `<app_data_dir>/youtube_downloads/<video_id>.mp4`, fetches its captions (best-effort —
-/// a project with no transcript still gets created, just not analyzable until one is added
-/// manually), and creates a project exactly the way an imported local file would — so
-/// everything downstream (Analyze Clips, Analyze Full Video, templates, upload queue) is the
-/// same code path a locally-picked movie file already goes through, per SPEC.
 async fn run_download_inner(app: &AppHandle, video_id: &str) -> Result<(), String> {
     let manager = app.state::<DownloadManager>();
     let db = app.state::<Db>();

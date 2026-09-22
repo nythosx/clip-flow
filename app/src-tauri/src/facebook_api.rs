@@ -1,8 +1,4 @@
-// Facebook Graph API OAuth + video publishing, for both a connected Page and (where
-// Facebook's own permission model allows it — see `run_facebook_job` in queue_manager.rs)
-// the user's personal timeline. Same loopback-listener OAuth shape as tiktok_api.rs/
-// youtube_api.rs, since Facebook Login for a desktop app follows the same
-// authorization-code-in-a-browser-redirect pattern.
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -10,23 +6,13 @@ const GRAPH_VERSION: &str = "v19.0";
 const AUTH_BASE: &str = "https://www.facebook.com";
 const GRAPH_BASE: &str = "https://graph.facebook.com";
 const GRAPH_VIDEO_BASE: &str = "https://graph-video.facebook.com";
-// Facebook, like TikTok, requires the exact redirect URI to be pre-registered in the app's
-// dashboard ("Valid OAuth Redirect URIs" under Facebook Login settings) — it does not
-// support Google's "any localhost port" installed-app flow. Register
-// `http://localhost:OAUTH_REDIRECT_PORT/callback` there before connecting.
+
 pub const OAUTH_REDIRECT_PORT: u16 = 53684;
 
 pub fn redirect_uri() -> String {
     format!("http://localhost:{OAUTH_REDIRECT_PORT}/callback")
 }
 
-/// Scopes: `pages_show_list`/`pages_read_engagement` to enumerate managed Pages,
-/// `pages_manage_posts` + `publish_video` to post video to a Page, `public_profile` for the
-/// user's own name/picture. Posting to a personal timeline (`/me/videos`) additionally needs
-/// `publish_video` on the *user* token, which — like TikTok's Production posting — requires
-/// Meta App Review before it works for anyone other than the app's own developers/testers;
-/// this is prepared and will work in that Sandbox-equivalent (Development Mode + added
-/// testers) the same way TikTok's Sandbox did.
 pub fn authorize_url(app_id: &str, state: &str) -> String {
     let redirect = urlencoding_encode(&redirect_uri());
     let scope = urlencoding_encode(
@@ -104,10 +90,6 @@ pub async fn exchange_code(app_id: &str, app_secret: &str, code: &str) -> Result
     serde_json::from_str(&body).map_err(|e| format!("failed to parse Facebook token response: {e} — body: {body}"))
 }
 
-/// Trades the short-lived (~1-2h) token `exchange_code` returns for a long-lived (~60 day)
-/// one. Page access tokens derived afterward from `fetch_pages` inherit long-lived-ness from
-/// this, and effectively never expire as long as the user stays connected — this is why
-/// there's no `refresh_token` here the way TikTok/Google have one.
 pub async fn exchange_long_lived_token(app_id: &str, app_secret: &str, short_lived_token: &str) -> Result<TokenResponse, String> {
     let resp = client()
         .get(format!("{GRAPH_BASE}/{GRAPH_VERSION}/oauth/access_token"))
@@ -203,9 +185,6 @@ struct PageItem {
     picture: Option<PictureField>,
 }
 
-/// Lists every Page the connected user manages, each with its own (long-lived) Page access
-/// token — Facebook issues these directly in `/me/accounts`, no separate per-page exchange
-/// needed. Requires `pages_show_list` (granted in `authorize_url`'s scope).
 pub async fn fetch_pages(user_access_token: &str) -> Result<Vec<FacebookPage>, String> {
     let resp = client()
         .get(format!("{GRAPH_BASE}/{GRAPH_VERSION}/me/accounts"))
@@ -272,10 +251,6 @@ struct DetailsEnvelope {
     picture: Option<PictureField>,
 }
 
-/// Re-fetches full profile detail for a Page or the user themselves (`target` is either a
-/// Page id or `"me"`) — the "give me everything you can get" refresh behind Accounts'
-/// Reconnect action, same idea as `tiktok_api::fetch_user_info` pulling more fields than the
-/// minimum needed at connect time.
 pub async fn fetch_account_details(target: &str, access_token: &str) -> Result<AccountDetails, String> {
     let resp = client()
         .get(format!("{GRAPH_BASE}/{GRAPH_VERSION}/{target}"))
@@ -308,11 +283,6 @@ struct PublishVideoResponse {
     id: String,
 }
 
-/// Publishes a video to a Page's or (permission-permitting) the user's own timeline.
-/// `target` is a Page id, or `"me"` for the personal profile. Single-request multipart
-/// upload against `graph-video.facebook.com` — fine for typical short-form clip file sizes;
-/// Facebook's resumable chunked-upload API exists for multi-GB files but isn't needed here
-/// (mirrors tiktok_api::upload_video's same "read the whole clip into memory" approach).
 pub async fn publish_video(target: &str, access_token: &str, video_path: &Path, caption: &str) -> Result<String, String> {
     let bytes = tokio::fs::read(video_path).await.map_err(|e| e.to_string())?;
     let filename = video_path
@@ -339,9 +309,6 @@ pub async fn publish_video(target: &str, access_token: &str, video_path: &Path, 
     Ok(parsed.id)
 }
 
-/// Blocks until the OAuth redirect hits `http://localhost:OAUTH_REDIRECT_PORT/callback`,
-/// returning `code`/`state`. Same shape/timeout as the TikTok and YouTube callback
-/// listeners.
 pub async fn await_oauth_callback() -> Result<(String, String), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;

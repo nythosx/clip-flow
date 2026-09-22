@@ -20,10 +20,6 @@ interface RenderQueueStore {
 
 let listenersInitialized = false;
 
-// Read-only mirror of the backend's `render_queue` table (see render_manager.rs) — every
-// render request across every project shares one ffmpeg-serializing semaphore there, so this
-// is what lets the UI show "N renders pending in the background" instead of the user having
-// to guess whether a render they kicked off from a project they've since left is still going.
 export const useRenderQueueStore = create<RenderQueueStore>((set, get) => ({
   items: [],
 
@@ -40,7 +36,7 @@ export const useRenderQueueStore = create<RenderQueueStore>((set, get) => ({
       const items = await invoke<RenderQueueItem[]>("get_render_queue");
       set({ items });
     } catch {
-      // Best-effort background indicator — a failed poll just leaves the last known state.
+
     }
   },
 }));

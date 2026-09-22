@@ -696,6 +696,11 @@ const Orchestrator = (() => {
       primer: TRIM_PRIMER,
       task: trimTask({ duration, transcript }),
       responseShape: 'array',
+      // No deepThink here (a trim call doesn't need extended reasoning), but the default
+      // 60s stabilization timeout is still too tight for a real first+last-5-minutes
+      // excerpt on the live site — give it the same budget as the reasoning calls purely
+      // for latency headroom, not because it reasons any harder.
+      timeoutMs: DEEP_REASONING_TIMEOUT_MS,
       migrationThreshold,
       minAiCallIntervalMs,
     });

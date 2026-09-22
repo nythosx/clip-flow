@@ -38,8 +38,6 @@ let listenersInitialized = false;
 export const useDownloadsStore = create<DownloadsStore>((set, get) => ({
   downloads: [],
 
-  // Backend is fire-and-forget (start_youtube_download returns immediately) — this event is
-  // the only way progress/status actually reaches the UI, Chrome-downloads-tray style.
   initListeners: () => {
     if (listenersInitialized) return;
     listenersInitialized = true;

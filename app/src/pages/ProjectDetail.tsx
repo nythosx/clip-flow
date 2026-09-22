@@ -32,6 +32,27 @@ function stageLabel(stage: string): string {
   return STAGE_LABELS[stage] ?? stage;
 }
 
+type StageStatus = "done" | "processing" | "pending";
+
+const CLIPS_STAGE_SEQUENCE = ["starting", "parsing_transcript", "smart_trimmer", "clip_finder", "saving", "captions", "done"];
+const MOVIE_STAGE_SEQUENCE = ["starting", "parsing_transcript", "smart_trimmer", "movie_segmenter", "saving", "captions", "done"];
+
+function stageSequenceFor(mode: "clips" | "movie"): string[] {
+  return mode === "movie" ? MOVIE_STAGE_SEQUENCE : CLIPS_STAGE_SEQUENCE;
+}
+
+function stageStatuses(sequence: string[], activeStage: string | undefined): StageStatus[] {
+
+  if (activeStage === "done") return sequence.map(() => "done");
+  const activeIndex = activeStage ? sequence.indexOf(activeStage) : -1;
+  return sequence.map((_, i) => {
+    if (activeIndex === -1) return "pending";
+    if (i < activeIndex) return "done";
+    if (i === activeIndex) return "processing";
+    return "pending";
+  });
+}
+
 function formatClockTime(timestamp: number): string {
   return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
@@ -64,11 +85,6 @@ function useThumbnailSrc(moviePath: string | undefined, seekSeconds: number, cac
   return src;
 }
 
-// CapCut-style live preview: approximates the FFmpeg filter graph in ffmpeg.rs's
-// render_final() with CSS so a template's effect is visible before a real render is
-// kicked off. Position math mirrors ffmpeg's `(main_w-overlay_w)*x` overlay placement via
-// an anchor-point transform, and font sizing uses container-query units (`cqw`) to scale
-// with the actual rendered preview box instead of the template's authored 1080px width.
 function CaptionOverlayBlock({
   caption,
   outputWidth,
@@ -105,8 +121,6 @@ function CaptionOverlayBlock({
   );
 }
 
-// Subtitle has the same box/position/style fields as a caption but no fixed `text` — the
-// line currently on screen is passed in from the parent's video-time-driven cue lookup.
 function SubtitleOverlayBlock({
   subtitle,
   outputWidth,
@@ -237,12 +251,6 @@ const STATUS_COLORS: Record<string, string> = {
   error: "bg-red-600",
 };
 
-// A project card: thumbnail with name/status/stats overlaid on top of it (not stacked
-// below), so the sidebar can list every project as a compact switcher instead of only
-// showing one project's details at a time.
-/// Deleting is permanent (the Rust side cascades to the project's clips/upload_queue rows
-/// and nothing un-deletes a movie file reference) — this is the only thing standing between
-/// a stray click on the small trash icon and losing a whole project's work.
 function DeleteProjectDialog({
   project,
   deleting,
@@ -703,17 +711,15 @@ function AutoUploadDialog({
   accounts,
   queueItems,
   selectedTemplateId,
-  renderClipFinal,
   onClose,
 }: {
   clips: Clip[];
   accounts: Account[];
   queueItems: QueueItem[];
   selectedTemplateId: string;
-  renderClipFinal: (clipId: string, templateId: string) => Promise<void>;
   onClose: () => void;
 }) {
-  const { addToQueue } = useQueueStore();
+  const { queueAndRender } = useQueueStore();
 
   // clipId -> set of accountIds already queued/uploaded for it, regardless of status —
   // re-adding a pair that's already there would just create a duplicate queue row.
@@ -734,13 +740,29 @@ function AutoUploadDialog({
     [clips, alreadyQueued, accounts.length]
   );
 
+  const [queuedFilter, setQueuedFilter] = useState<"all" | "not_queued" | "partially_queued">("all");
+  const displayedCandidates = useMemo(
+    () =>
+      candidates.filter((c) => {
+        if (queuedFilter === "all") return true;
+        const queuedCount = alreadyQueued.get(c.id)?.size ?? 0;
+        return queuedFilter === "not_queued" ? queuedCount === 0 : queuedCount > 0;
+      }),
+    [candidates, alreadyQueued, queuedFilter]
+  );
+
   const [selectedClipIds, setSelectedClipIds] = useState<Set<string>>(() => new Set(candidates.map((c) => c.id)));
+
+  useEffect(() => {
+    setSelectedClipIds(new Set(displayedCandidates.map((c) => c.id)));
+  }, [queuedFilter]);
+
   const [selectedAccountIds, setSelectedAccountIds] = useState<Set<string>>(
     () => new Set(accounts.filter((a) => a.isActive).map((a) => a.id))
   );
   // A second click, not a second modal — this queues real uploads that start immediately
   // (queue_manager.rs's kick() picks them up right away), so the first click on "Queue N
-  // items" just swaps that button for an explicit confirmation instead of firing right away.
+
   const [confirming, setConfirming] = useState(false);
 
   function toggleClip(id: string) {
@@ -762,39 +784,33 @@ function AutoUploadDialog({
   function submit() {
     const clipIds = [...selectedClipIds];
     const accountIds = [...selectedAccountIds];
-    // Fire-and-forget: rendering + queueing runs in the background (the render queue
-    // already serializes/tracks itself via render_manager.rs, and queue items show up in
-    // the Queue page immediately after each addToQueue) — the modal doesn't need to stay
-    // open and block the user until every clip in the batch is done. Per-clip failures are
-    // surfaced where the user will actually look afterward (the render queue indicator /
-    // the queue item's own error state), not in this now-closed modal.
+
     (async () => {
       for (const clipId of clipIds) {
         try {
-          // Template is applied here, at queue time, not while browsing — so switching
-          // templates while looking at clips never kicks off a render. Always re-renders
-          // (no "already has a final render for this template id" shortcut) because the
-          // template's own config (alignment, text, colors, ...) can change without its id
-          // changing — reusing an old render by id alone would silently serve stale output.
-          if (selectedTemplateId) {
-            await renderClipFinal(clipId, selectedTemplateId);
-          }
           const already = alreadyQueued.get(clipId) ?? new Set<string>();
           const toQueue = accountIds.filter((accId) => !already.has(accId));
           if (toQueue.length > 0) {
-            await addToQueue(clipId, toQueue);
+            await queueAndRender(clipId, toQueue, selectedTemplateId || null);
           }
         } catch (e) {
-          console.error(`Queue uploads: failed for clip ${clipId}:`, e);
+          console.error(`Queue uploads: failed to queue clip ${clipId}:`, e);
         }
       }
     })();
     onClose();
   }
 
+  const partNumbers = useMemo(() => {
+    const map = new Map<string, number>();
+    const parts = clips.filter((c) => c.kind === "part").sort((a, b) => a.startSeconds - b.startSeconds);
+    parts.forEach((c, i) => map.set(c.id, i + 1));
+    return map;
+  }, [clips]);
+
   const label = (c: Clip) => {
     const excerpt = (c.transcriptExcerpt ?? "").trim();
-    const kindLabel = c.kind === "part" ? "Part" : "Clip";
+    const kindLabel = c.kind === "part" ? `Part ${partNumbers.get(c.id) ?? "?"}` : "Clip";
     return `${kindLabel} · ${formatDuration(c.endSeconds - c.startSeconds)}${excerpt ? " · " + excerpt.slice(0, 60) : ""}`;
   };
 
@@ -837,28 +853,43 @@ function AutoUploadDialog({
             </div>
 
             <div className="flex items-center justify-between mb-1.5">
-              <p className="text-xs text-neutral-400">Clips &amp; parts ({candidates.length} ready)</p>
-              <div className="flex gap-2 text-xs">
-                <button
-                  className="text-blue-400 hover:text-blue-300"
-                  onClick={() => setSelectedClipIds(new Set(candidates.map((c) => c.id)))}
+              <p className="text-xs text-neutral-400">Clips &amp; parts ({displayedCandidates.length} ready)</p>
+              <div className="flex items-center gap-2 text-xs">
+                <select
+                  className="px-2 py-1 rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-200"
+                  value={queuedFilter}
+                  onChange={(e) => setQueuedFilter(e.target.value as typeof queuedFilter)}
                 >
+                  <option value="all">All ready</option>
+                  <option value="not_queued">Not queued yet</option>
+                  <option value="partially_queued">Already queued for some</option>
+                </select>
+                <label className="flex items-center gap-1.5 cursor-pointer text-neutral-300">
+                  <input
+                    type="checkbox"
+                    className="accent-blue-500"
+                    checked={
+                      displayedCandidates.length > 0 &&
+                      displayedCandidates.every((c) => selectedClipIds.has(c.id))
+                    }
+                    onChange={(e) =>
+                      setSelectedClipIds(e.target.checked ? new Set(displayedCandidates.map((c) => c.id)) : new Set())
+                    }
+                  />
                   Select all
-                </button>
-                <button className="text-neutral-500 hover:text-neutral-300" onClick={() => setSelectedClipIds(new Set())}>
-                  Clear
-                </button>
+                </label>
               </div>
             </div>
 
             <div className="flex-1 min-h-0 overflow-y-auto border border-neutral-800 rounded divide-y divide-neutral-800">
-              {candidates.length === 0 ? (
+              {displayedCandidates.length === 0 ? (
                 <p className="text-sm text-neutral-500 p-3">
-                  Nothing to upload — every rendered clip/part is already queued for all
-                  accounts.
+                  {candidates.length === 0
+                    ? "Nothing to upload — every rendered clip/part is already queued for all accounts."
+                    : "Nothing matches this filter."}
                 </p>
               ) : (
-                candidates.map((c) => (
+                displayedCandidates.map((c) => (
                   <label key={c.id} className="flex items-center gap-2 px-3 py-2 text-sm cursor-pointer hover:bg-neutral-800/50">
                     <input
                       type="checkbox"
@@ -909,12 +940,6 @@ function AutoUploadDialog({
   );
 }
 
-// Automatic mismatch warning + manual re-sync control — see
-// commands::project::get_transcript_sync_status/set_transcript_offset. There's no forced
-// audio-alignment "matcher" here (that needs real speech-to-timing analysis, e.g. Whisper's
-// word timestamps, which this app doesn't run) — this is a constant-offset correction: type
-// how many seconds the transcript is early/late and every subtitle cue shifts by that much,
-// both in this live preview and in the final render.
 function TranscriptSyncWarning({
   status,
   expanded,
@@ -987,9 +1012,13 @@ function TranscriptSyncWarning({
 
 function ActivityLogPanel({
   entries,
+  activeProgress,
+  mode,
   onClose,
 }: {
   entries: import("../stores/projectStore").ActivityLogEntry[];
+  activeProgress: import("../stores/projectStore").AnalysisProgress | null;
+  mode: "clips" | "movie";
   onClose: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -997,6 +1026,18 @@ function ActivityLogPanel({
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [entries.length]);
+
+  const isAnalyzing = !!activeProgress;
+  const sequence = stageSequenceFor(mode);
+  const statuses = stageStatuses(sequence, activeProgress?.stage);
+
+  // Most recent timestamp each real (non-"ai_status") stage was reached, so the live
+  // "AI Engine" chatter can be nested under whichever step is currently processing instead
+  // of sitting in its own disconnected flat list.
+  const stageStartTs: Record<string, number> = {};
+  for (const e of entries) {
+    if (e.stage !== "ai_status") stageStartTs[e.stage] = e.timestamp;
+  }
 
   return (
     <div className="fixed right-0 top-14 bottom-0 w-[380px] bg-[#161618] border-l border-black/40 z-40 flex flex-col shadow-2xl">
@@ -1006,22 +1047,79 @@ function ActivityLogPanel({
           <X size={16} />
         </button>
       </div>
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
-        {entries.length === 0 ? (
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3">
+        {isAnalyzing ? (
+          <ol className="timeline relative border-l border-neutral-800 ml-2 space-y-5">
+            {sequence.map((stage, i) => {
+              const status = statuses[i];
+              const ts = stageStartTs[stage];
+              const chatter =
+                status === "processing"
+                  ? entries.filter((e) => e.stage === "ai_status" && ts != null && e.timestamp >= ts)
+                  : [];
+              return (
+                <li key={stage} className="relative pl-4">
+                  <span
+                    className={
+                      "absolute -left-[5px] top-0.5 w-[9px] h-[9px] rounded-full border-2 border-[#161618] " +
+                      (status === "done" ? "bg-emerald-500" : status === "processing" ? "bg-blue-500 animate-pulse" : "bg-neutral-700")
+                    }
+                  />
+                  <div className="flex items-center gap-2">
+                    <p
+                      className={
+                        "text-xs font-medium " +
+                        (status === "done" ? "text-neutral-300" : status === "processing" ? "text-white" : "text-neutral-600")
+                      }
+                    >
+                      {stageLabel(stage)}
+                    </p>
+                    <span
+                      className={
+                        "text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded shrink-0 " +
+                        (status === "done"
+                          ? "bg-emerald-500/15 text-emerald-400"
+                          : status === "processing"
+                          ? "bg-blue-500/15 text-blue-400"
+                          : "bg-neutral-800 text-neutral-600")
+                      }
+                    >
+                      {status === "done" ? "Done" : status === "processing" ? "Processing" : "Pending"}
+                    </span>
+                  </div>
+                  {ts != null && status !== "pending" && (
+                    <p className="text-[10px] font-mono text-neutral-600 mt-0.5">{formatClockTime(ts)}</p>
+                  )}
+                  {chatter.length > 0 && (
+                    <ul className="mt-1.5 space-y-1 border-l border-neutral-800 pl-2 ml-[3px]">
+                      {chatter.map((c) => (
+                        <li key={c.id} className="text-[11px] text-neutral-500">
+                          {c.detail}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              );
+            })}
+          </ol>
+        ) : entries.length === 0 ? (
           <p className="text-xs text-neutral-500">Nothing yet — run Analyze to see a live timeline here.</p>
         ) : (
-          entries.map((entry) => (
-            <div key={entry.id} className={entry.stage === "ai_status" ? "pl-3 border-l-2 border-neutral-800" : "pl-3 border-l-2 border-blue-600"}>
-              <div className="flex items-center gap-2 text-[10px] text-neutral-500">
-                <span className="font-mono">{formatClockTime(entry.timestamp)}</span>
-                <span className="uppercase">{entry.mode}</span>
-                {entry.progress >= 0 && <span>{Math.round(entry.progress * 100)}%</span>}
+          <div className="space-y-2">
+            {entries.map((entry) => (
+              <div key={entry.id} className={entry.stage === "ai_status" ? "pl-3 border-l-2 border-neutral-800" : "pl-3 border-l-2 border-blue-600"}>
+                <div className="flex items-center gap-2 text-[10px] text-neutral-500">
+                  <span className="font-mono">{formatClockTime(entry.timestamp)}</span>
+                  <span className="uppercase">{entry.mode}</span>
+                  {entry.progress >= 0 && <span>{Math.round(entry.progress * 100)}%</span>}
+                </div>
+                <p className={entry.stage === "ai_status" ? "text-xs text-neutral-400" : "text-xs text-neutral-200 font-medium"}>
+                  {entry.stage === "ai_status" ? entry.detail : stageLabel(entry.stage)}
+                </p>
               </div>
-              <p className={entry.stage === "ai_status" ? "text-xs text-neutral-400" : "text-xs text-neutral-200 font-medium"}>
-                {entry.stage === "ai_status" ? entry.detail : stageLabel(entry.stage)}
-              </p>
-            </div>
-          ))
+            ))}
+          </div>
         )}
       </div>
     </div>
@@ -1072,7 +1170,7 @@ export default function ProjectDetail() {
   const [savingPartCaption, setSavingPartCaption] = useState(false);
   const { settings, fetchSettings } = useSettingsStore();
   const { accounts, fetchAccounts } = useAccountStore();
-  const { addToQueue, items: queueItems, fetchQueue } = useQueueStore();
+  const { queueAndRender, items: queueItems, fetchQueue } = useQueueStore();
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>("");
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [selectedAccountIds, setSelectedAccountIds] = useState<Set<string>>(new Set());
@@ -1627,10 +1725,7 @@ export default function ProjectDetail() {
                 {(() => {
                   // The bulk backfill (after slicing a new project, or "Generate all
                   // missing") only reports project-wide progress, not which clip it's on —
-                  // so this can't say "generating this one right now", only "still working
-                  // through the list, this one just hasn't come up yet". That's still a lot
-                  // better than an empty textarea with zero explanation, which previously
-                  // looked identical to nothing happening at all.
+
                   const backfillRunning =
                     !selectedClip.aiCaption &&
                     generatingCaptionClipId !== selectedClip.id &&
@@ -1832,14 +1927,7 @@ export default function ProjectDetail() {
                     if (selectedAccountIds.size === 0) return;
                     setQueueing(true);
                     try {
-                      // Apply the selected template now, at queue time, instead of while
-                      // just browsing the clip. Always re-renders (no "already rendered
-                      // with this template id" shortcut) since the template's own config
-                      // can change without its id changing.
-                      if (selectedTemplateId) {
-                        await renderClipFinal(selectedClip.id, selectedTemplateId);
-                      }
-                      await addToQueue(selectedClip.id, [...selectedAccountIds]);
+                      await queueAndRender(selectedClip.id, [...selectedAccountIds], selectedTemplateId || null);
                       setQueuedClipId(selectedClip.id);
                     } finally {
                       setQueueing(false);
@@ -1952,7 +2040,6 @@ export default function ProjectDetail() {
           accounts={accounts}
           queueItems={queueItems.filter((item) => clips.some((c) => c.id === item.clipId))}
           selectedTemplateId={selectedTemplateId}
-          renderClipFinal={renderClipFinal}
           onClose={() => {
             setShowAutoUpload(false);
             fetchQueue();
@@ -1967,7 +2054,14 @@ export default function ProjectDetail() {
         />
       )}
 
-      {showActivityLog && <ActivityLogPanel entries={projectActivityLog} onClose={() => setShowActivityLog(false)} />}
+      {showActivityLog && (
+        <ActivityLogPanel
+          entries={projectActivityLog}
+          activeProgress={analyzing ? activeAnalysisProgress : null}
+          mode={displayMode}
+          onClose={() => setShowActivityLog(false)}
+        />
+      )}
 
       {showAutoUploadSettings && <AutoUploadSettingsDialog onClose={() => setShowAutoUploadSettings(false)} />}
 
